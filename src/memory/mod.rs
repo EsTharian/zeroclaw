@@ -142,6 +142,7 @@ fn embedding_provider_env_key(provider: &str) -> Option<String> {
         "openai" => "OPENAI_API_KEY",
         "openrouter" => "OPENROUTER_API_KEY",
         "cohere" => "COHERE_API_KEY",
+        "google" => "MAJORDOMO_GEMINI_KEY",
         _ => return None,
     };
     std::env::var(env_var)

@@ -40,6 +40,91 @@ impl EmbeddingProvider for NoopEmbedding {
     }
 }
 
+// ── Google Gemini embedding provider ─────────────────────────
+
+pub struct GeminiEmbedding {
+    api_key: String,
+    model: String,
+    dims: usize,
+}
+
+impl GeminiEmbedding {
+    pub fn new(api_key: &str, model: &str, dims: usize) -> Self {
+        Self {
+            api_key: api_key.to_string(),
+            model: model.to_string(),
+            dims,
+        }
+    }
+
+    fn http_client(&self) -> reqwest::Client {
+        crate::config::build_runtime_proxy_client("memory.embeddings")
+    }
+}
+
+#[async_trait]
+impl EmbeddingProvider for GeminiEmbedding {
+    fn name(&self) -> &str {
+        "google"
+    }
+
+    fn dimensions(&self) -> usize {
+        self.dims
+    }
+
+    async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Use the OpenAI-compatible Gemini endpoint
+        let url = "https://generativelanguage.googleapis.com/v1beta/openai/embeddings";
+        let body = serde_json::json!({
+            "model": self.model,
+            "input": texts,
+        });
+
+        let resp = self
+            .http_client()
+            .post(url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Gemini Embedding API error {status}: {text}");
+        }
+
+        let json: serde_json::Value = resp.json().await?;
+        let data = json
+            .get("data")
+            .and_then(|d| d.as_array())
+            .ok_or_else(|| anyhow::anyhow!("Invalid Gemini embedding response: missing 'data'"))?;
+
+        let mut embeddings = Vec::with_capacity(data.len());
+        for item in data {
+            let embedding = item
+                .get("embedding")
+                .and_then(|e| e.as_array())
+                .ok_or_else(|| anyhow::anyhow!("Invalid Gemini embedding item"))?;
+
+            #[allow(clippy::cast_possible_truncation)]
+            let vec: Vec<f32> = embedding
+                .iter()
+                .filter_map(|v| v.as_f64().map(|f| f as f32))
+                .collect();
+
+            embeddings.push(vec);
+        }
+
+        Ok(embeddings)
+    }
+}
+
 // ── OpenAI-compatible embedding provider ─────────────────────
 
 pub struct OpenAiEmbedding {
@@ -171,6 +256,10 @@ pub fn create_embedding_provider(
                 model,
                 dims,
             ))
+        }
+        "google" => {
+            let key = api_key.unwrap_or("");
+            Box::new(GeminiEmbedding::new(key, model, dims))
         }
         "openrouter" => {
             let key = api_key.unwrap_or("");
