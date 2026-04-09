@@ -1089,7 +1089,7 @@ pub async fn run_gateway(
                         if let Err(e) = hyper_util::server::conn::auto::Builder::new(
                             hyper_util::rt::TokioExecutor::new(),
                         )
-                        .serve_connection(io, hyper_svc)
+                        .serve_connection_with_upgrades(io, hyper_svc)
                         .await
                         {
                             tracing::debug!("connection error from {remote_addr}: {e}");
