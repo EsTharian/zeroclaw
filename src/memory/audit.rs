@@ -140,6 +140,7 @@ impl<M: Memory> Memory for AuditedMemory<M> {
         session_id: Option<&str>,
         since: Option<&str>,
         until: Option<&str>,
+        search_mode: Option<SearchMode>,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
         self.log_audit(
             AuditOp::Recall,
@@ -149,7 +150,7 @@ impl<M: Memory> Memory for AuditedMemory<M> {
             Some(&format!("query={query}")),
         );
         self.inner
-            .recall(query, limit, session_id, since, until)
+            .recall(query, limit, session_id, since, until, search_mode)
             .await
     }
 
@@ -258,7 +259,7 @@ mod tests {
         let inner = NoneMemory::new();
         let audited = AuditedMemory::new(inner, tmp.path()).unwrap();
 
-        let _ = audited.recall("query", 10, None, None, None).await;
+        let _ = audited.recall("query", 10, None, None, None, None).await;
 
         assert_eq!(audited.audit_count().unwrap(), 1);
     }

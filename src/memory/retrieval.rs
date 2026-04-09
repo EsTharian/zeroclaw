@@ -139,7 +139,7 @@ impl RetrievalPipeline {
                             .await?
                     } else {
                         self.memory
-                            .recall(query, limit, session_id, since, until)
+                            .recall(query, limit, session_id, since, until, None)
                             .await?
                     };
 

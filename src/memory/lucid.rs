@@ -1,5 +1,6 @@
 use super::sqlite::SqliteMemory;
 use super::traits::{Memory, MemoryCategory, MemoryEntry};
+use crate::config::schema::SearchMode;
 use async_trait::async_trait;
 use chrono::Local;
 use parking_lot::Mutex;
@@ -330,6 +331,7 @@ impl Memory for LucidMemory {
         session_id: Option<&str>,
         since: Option<&str>,
         until: Option<&str>,
+        search_mode: Option<SearchMode>,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
         let since_dt = since
             .map(chrono::DateTime::parse_from_rfc3339)
@@ -347,7 +349,7 @@ impl Memory for LucidMemory {
 
         let local_results = self
             .local
-            .recall(query, limit, session_id, since, until)
+            .recall(query, limit, session_id, since, until, search_mode)
             .await?;
         if limit == 0
             || local_results.len() >= limit
@@ -584,7 +586,7 @@ exit 1
             .await
             .unwrap();
 
-        let entries = memory.recall("auth", 5, None, None, None).await.unwrap();
+        let entries = memory.recall("auth", 5, None, None, None, None).await.unwrap();
 
         assert!(
             entries
@@ -610,7 +612,7 @@ exit 1
             .await
             .unwrap();
 
-        let entries = memory.recall("auth", 5, None, None, None).await.unwrap();
+        let entries = memory.recall("auth", 5, None, None, None, None).await.unwrap();
 
         assert!(
             entries
@@ -652,7 +654,7 @@ exit 1
             .await
             .unwrap();
 
-        let entries = memory.recall("rust", 5, None, None, None).await.unwrap();
+        let entries = memory.recall("rust", 5, None, None, None, None).await.unwrap();
         assert!(
             entries
                 .iter()
@@ -714,8 +716,8 @@ exit 1
             Duration::from_secs(5),
         );
 
-        let first = memory.recall("auth", 5, None, None, None).await.unwrap();
-        let second = memory.recall("auth", 5, None, None, None).await.unwrap();
+        let first = memory.recall("auth", 5, None, None, None, None).await.unwrap();
+        let second = memory.recall("auth", 5, None, None, None, None).await.unwrap();
 
         assert!(first.is_empty());
         assert!(second.is_empty());

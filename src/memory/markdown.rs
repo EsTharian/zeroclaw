@@ -1,4 +1,5 @@
 use super::traits::{Memory, MemoryCategory, MemoryEntry};
+use crate::config::schema::SearchMode;
 use async_trait::async_trait;
 use chrono::Local;
 use std::path::{Path, PathBuf};
@@ -163,6 +164,7 @@ impl Memory for MarkdownMemory {
         _session_id: Option<&str>,
         since: Option<&str>,
         until: Option<&str>,
+        _search_mode: Option<SearchMode>,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
         let since_dt = since
             .map(chrono::DateTime::parse_from_rfc3339)
@@ -324,7 +326,7 @@ mod tests {
             .await
             .unwrap();
 
-        let results = mem.recall("Rust", 10, None, None, None).await.unwrap();
+        let results = mem.recall("Rust", 10, None, None, None, None).await.unwrap();
         assert!(results.len() >= 2);
         assert!(
             results
@@ -340,7 +342,7 @@ mod tests {
             .await
             .unwrap();
         let results = mem
-            .recall("javascript", 10, None, None, None)
+            .recall("javascript", 10, None, None, None, None)
             .await
             .unwrap();
         assert!(results.is_empty());
@@ -389,7 +391,7 @@ mod tests {
     #[tokio::test]
     async fn markdown_empty_recall() {
         let (_tmp, mem) = temp_workspace();
-        let results = mem.recall("anything", 10, None, None, None).await.unwrap();
+        let results = mem.recall("anything", 10, None, None, None, None).await.unwrap();
         assert!(results.is_empty());
     }
 

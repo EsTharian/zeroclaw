@@ -115,7 +115,7 @@ impl Tool for DiscordSearchTool {
 
         match self
             .discord_memory
-            .recall(query, limit, channel_id, since, until)
+            .recall(query, limit, channel_id, since, until, None)
             .await
         {
             Ok(entries) if entries.is_empty() => Ok(ToolResult {

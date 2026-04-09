@@ -199,7 +199,7 @@ pub trait Memory: Send + Sync {
         until: Option<&str>,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
         let entries = self
-            .recall(query, limit * 2, session_id, since, until)
+            .recall(query, limit * 2, session_id, since, until, None)
             .await?;
         let filtered: Vec<MemoryEntry> = entries
             .into_iter()

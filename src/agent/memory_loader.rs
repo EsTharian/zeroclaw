@@ -44,7 +44,7 @@ impl MemoryLoader for DefaultMemoryLoader {
         session_id: Option<&str>,
     ) -> anyhow::Result<String> {
         let mut entries = memory
-            .recall(user_message, self.limit, session_id, None, None)
+            .recall(user_message, self.limit, session_id, None, None, None)
             .await?;
         if entries.is_empty() {
             return Ok(String::new());
@@ -109,6 +109,7 @@ mod tests {
             _session_id: Option<&str>,
             _since: Option<&str>,
             _until: Option<&str>,
+            _search_mode: Option<crate::config::schema::SearchMode>,
         ) -> anyhow::Result<Vec<MemoryEntry>> {
             if limit == 0 {
                 return Ok(vec![]);
@@ -175,6 +176,7 @@ mod tests {
             _session_id: Option<&str>,
             _since: Option<&str>,
             _until: Option<&str>,
+            _search_mode: Option<crate::config::schema::SearchMode>,
         ) -> anyhow::Result<Vec<MemoryEntry>> {
             Ok(self.entries.as_ref().clone())
         }

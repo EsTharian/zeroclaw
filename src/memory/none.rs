@@ -84,7 +84,7 @@ mod tests {
         assert!(memory.get("k").await.unwrap().is_none());
         assert!(
             memory
-                .recall("k", 10, None, None, None)
+                .recall("k", 10, None, None, None, None)
                 .await
                 .unwrap()
                 .is_empty()

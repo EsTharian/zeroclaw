@@ -313,7 +313,7 @@ async fn build_context(
     let mut context = String::new();
 
     // Pull relevant memories for this message
-    if let Ok(mut entries) = mem.recall(user_msg, 5, session_id, None, None).await {
+    if let Ok(mut entries) = mem.recall(user_msg, 5, session_id, None, None, None).await {
         // Apply time decay: older non-Core memories score lower
         decay::apply_time_decay(&mut entries, decay::DEFAULT_HALF_LIFE_DAYS);
 
@@ -8087,7 +8087,7 @@ Tail"#;
 
         assert_eq!(mem.count().await.unwrap(), 2);
 
-        let recalled = mem.recall("45", 5, None, None, None).await.unwrap();
+        let recalled = mem.recall("45", 5, None, None, None, None).await.unwrap();
         assert!(recalled.iter().any(|entry| entry.content.contains("45")));
     }
 

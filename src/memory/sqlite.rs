@@ -608,6 +608,7 @@ impl Memory for SqliteMemory {
         session_id: Option<&str>,
         since: Option<&str>,
         until: Option<&str>,
+        search_mode: Option<SearchMode>,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
         // Time-only query: list by time range when no keywords
         if query.trim().is_empty() {
@@ -617,7 +618,8 @@ impl Memory for SqliteMemory {
         }
 
         // Compute query embedding only when needed (skip for BM25-only mode)
-        let query_embedding = if self.search_mode == SearchMode::Bm25 {
+        let effective_mode = search_mode.unwrap_or_else(|| self.search_mode.clone());
+        let query_embedding = if effective_mode == SearchMode::Bm25 {
             None
         } else {
             self.get_or_compute_embedding(query).await?
@@ -630,7 +632,7 @@ impl Memory for SqliteMemory {
         let until_owned = until.map(String::from);
         let vector_weight = self.vector_weight;
         let keyword_weight = self.keyword_weight;
-        let search_mode = self.search_mode.clone();
+        let search_mode = effective_mode;
 
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
             let conn = conn.lock();
@@ -1082,7 +1084,7 @@ impl Memory for SqliteMemory {
         until: Option<&str>,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
         let entries = self
-            .recall(query, limit * 2, session_id, since, until)
+            .recall(query, limit * 2, session_id, since, until, None)
             .await?;
         let filtered: Vec<MemoryEntry> = entries
             .into_iter()
@@ -1209,7 +1211,7 @@ mod tests {
         .await
         .unwrap();
 
-        let results = mem.recall("Rust", 10, None, None, None).await.unwrap();
+        let results = mem.recall("Rust", 10, None, None, None, None).await.unwrap();
         assert_eq!(results.len(), 2);
         assert!(
             results
@@ -1228,7 +1230,7 @@ mod tests {
             .await
             .unwrap();
 
-        let results = mem.recall("fast safe", 10, None, None, None).await.unwrap();
+        let results = mem.recall("fast safe", 10, None, None, None, None).await.unwrap();
         assert!(!results.is_empty());
         // Entry with both keywords should score higher
         assert!(results[0].content.contains("safe") && results[0].content.contains("fast"));
@@ -1241,7 +1243,7 @@ mod tests {
             .await
             .unwrap();
         let results = mem
-            .recall("javascript", 10, None, None, None)
+            .recall("javascript", 10, None, None, None, None)
             .await
             .unwrap();
         assert!(results.is_empty());
@@ -1386,7 +1388,7 @@ mod tests {
         .await
         .unwrap();
 
-        let results = mem.recall("Rust", 10, None, None, None).await.unwrap();
+        let results = mem.recall("Rust", 10, None, None, None, None).await.unwrap();
         assert!(results.len() >= 2);
         // All results should contain "Rust"
         for r in &results {
@@ -1411,7 +1413,7 @@ mod tests {
             .await
             .unwrap();
 
-        let results = mem.recall("quick dog", 10, None, None, None).await.unwrap();
+        let results = mem.recall("quick dog", 10, None, None, None, None).await.unwrap();
         assert!(!results.is_empty());
         // "The quick dog runs fast" matches both terms
         assert!(results[0].content.contains("quick"));
@@ -1424,7 +1426,7 @@ mod tests {
             .await
             .unwrap();
         // Empty query = time-only mode: returns recent entries
-        let results = mem.recall("", 10, None, None, None).await.unwrap();
+        let results = mem.recall("", 10, None, None, None, None).await.unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].key, "a");
     }
@@ -1436,7 +1438,7 @@ mod tests {
             .await
             .unwrap();
         // Whitespace-only query = time-only mode: returns recent entries
-        let results = mem.recall("   ", 10, None, None, None).await.unwrap();
+        let results = mem.recall("   ", 10, None, None, None, None).await.unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].key, "a");
     }
@@ -1666,7 +1668,7 @@ mod tests {
         assert_eq!(count, 0);
 
         // FTS should still work after rebuild
-        let results = mem.recall("reindex", 10, None, None, None).await.unwrap();
+        let results = mem.recall("reindex", 10, None, None, None, None).await.unwrap();
         assert_eq!(results.len(), 2);
     }
 
@@ -1687,7 +1689,7 @@ mod tests {
         }
 
         let results = mem
-            .recall("common keyword", 5, None, None, None)
+            .recall("common keyword", 5, None, None, None, None)
             .await
             .unwrap();
         assert!(results.len() <= 5);
@@ -1702,7 +1704,7 @@ mod tests {
             .await
             .unwrap();
 
-        let results = mem.recall("scored", 10, None, None, None).await.unwrap();
+        let results = mem.recall("scored", 10, None, None, None, None).await.unwrap();
         assert!(!results.is_empty());
         for r in &results {
             assert!(r.score.is_some(), "Expected score on result: {:?}", r.key);
@@ -1718,7 +1720,7 @@ mod tests {
             .await
             .unwrap();
         // Quotes in query should not crash FTS5
-        let results = mem.recall("\"hello\"", 10, None, None, None).await.unwrap();
+        let results = mem.recall("\"hello\"", 10, None, None, None, None).await.unwrap();
         // May or may not match depending on FTS5 escaping, but must not error
         assert!(results.len() <= 10);
     }
@@ -1729,7 +1731,7 @@ mod tests {
         mem.store("a1", "wildcard test content", MemoryCategory::Core, None)
             .await
             .unwrap();
-        let results = mem.recall("wild*", 10, None, None, None).await.unwrap();
+        let results = mem.recall("wild*", 10, None, None, None, None).await.unwrap();
         assert!(results.len() <= 10);
     }
 
@@ -1740,7 +1742,7 @@ mod tests {
             .await
             .unwrap();
         let results = mem
-            .recall("function()", 10, None, None, None)
+            .recall("function()", 10, None, None, None, None)
             .await
             .unwrap();
         assert!(results.len() <= 10);
@@ -1754,7 +1756,7 @@ mod tests {
             .unwrap();
         // Should not crash or leak data
         let results = mem
-            .recall("'; DROP TABLE memories; --", 10, None, None, None)
+            .recall("'; DROP TABLE memories; --", 10, None, None, None, None)
             .await
             .unwrap();
         assert!(results.len() <= 10);
@@ -1830,7 +1832,7 @@ mod tests {
             .await
             .unwrap();
         // Single char may not match FTS5 but LIKE fallback should work
-        let results = mem.recall("x", 10, None, None, None).await.unwrap();
+        let results = mem.recall("x", 10, None, None, None, None).await.unwrap();
         // Should not crash; may or may not find results
         assert!(results.len() <= 10);
     }
@@ -1841,7 +1843,7 @@ mod tests {
         mem.store("a", "some content", MemoryCategory::Core, None)
             .await
             .unwrap();
-        let results = mem.recall("some", 0, None, None, None).await.unwrap();
+        let results = mem.recall("some", 0, None, None, None, None).await.unwrap();
         assert!(results.is_empty());
     }
 
@@ -1855,7 +1857,7 @@ mod tests {
             .await
             .unwrap();
         let results = mem
-            .recall("matching content", 1, None, None, None)
+            .recall("matching content", 1, None, None, None, None)
             .await
             .unwrap();
         assert_eq!(results.len(), 1);
@@ -1873,7 +1875,7 @@ mod tests {
         .await
         .unwrap();
         // "rust" appears in key but not content — LIKE fallback checks key too
-        let results = mem.recall("rust", 10, None, None, None).await.unwrap();
+        let results = mem.recall("rust", 10, None, None, None, None).await.unwrap();
         assert!(!results.is_empty(), "Should match by key");
     }
 
@@ -1883,7 +1885,7 @@ mod tests {
         mem.store("jp", "日本語のテスト", MemoryCategory::Core, None)
             .await
             .unwrap();
-        let results = mem.recall("日本語", 10, None, None, None).await.unwrap();
+        let results = mem.recall("日本語", 10, None, None, None, None).await.unwrap();
         assert!(!results.is_empty());
     }
 
@@ -1934,7 +1936,7 @@ mod tests {
         .unwrap();
         mem.forget("ghost").await.unwrap();
         let results = mem
-            .recall("phantom memory", 10, None, None, None)
+            .recall("phantom memory", 10, None, None, None, None)
             .await
             .unwrap();
         assert!(
@@ -1977,7 +1979,7 @@ mod tests {
         let count = mem.reindex().await.unwrap();
         assert_eq!(count, 0); // Noop embedder → nothing to re-embed
         // Data should still be intact
-        let results = mem.recall("reindex", 10, None, None, None).await.unwrap();
+        let results = mem.recall("reindex", 10, None, None, None, None).await.unwrap();
         assert_eq!(results.len(), 1);
     }
 
@@ -2233,7 +2235,7 @@ mod tests {
 
         // Recall with session-a filter returns only session-a entry
         let results = mem
-            .recall("fact", 10, Some("sess-a"), None, None)
+            .recall("fact", 10, Some("sess-a"), None, None, None)
             .await
             .unwrap();
         assert_eq!(results.len(), 1);
@@ -2255,7 +2257,7 @@ mod tests {
             .unwrap();
 
         // Recall without session filter returns all matching entries
-        let results = mem.recall("fact", 10, None, None, None).await.unwrap();
+        let results = mem.recall("fact", 10, None, None, None, None).await.unwrap();
         assert_eq!(results.len(), 3);
     }
 
@@ -2273,14 +2275,14 @@ mod tests {
 
         // Session B cannot see session A data
         let results = mem
-            .recall("secret", 10, Some("sess-b"), None, None)
+            .recall("secret", 10, Some("sess-b"), None, None, None)
             .await
             .unwrap();
         assert!(results.is_empty());
 
         // Session A can see its own data
         let results = mem
-            .recall("secret", 10, Some("sess-a"), None, None)
+            .recall("secret", 10, Some("sess-a"), None, None, None)
             .await
             .unwrap();
         assert_eq!(results.len(), 1);
@@ -2336,7 +2338,7 @@ mod tests {
         {
             let mem = SqliteMemory::new(tmp.path()).unwrap();
             let results = mem
-                .recall("reopen", 10, Some("sess-x"), None, None)
+                .recall("reopen", 10, Some("sess-x"), None, None, None)
                 .await
                 .unwrap();
             assert_eq!(results.len(), 1);
@@ -2706,7 +2708,7 @@ mod tests {
             .await
             .unwrap();
 
-        let results = mem.recall("Rust", 10, None, None, None).await.unwrap();
+        let results = mem.recall("Rust", 10, None, None, None, None).await.unwrap();
         assert!(!results.is_empty(), "BM25 mode should find keyword matches");
         assert!(
             results.iter().any(|e| e.content.contains("Rust")),
@@ -2739,7 +2741,7 @@ mod tests {
 
         // With NoopEmbedding, vector search returns empty, and FTS is skipped.
         // The recall method falls back to LIKE search.
-        let results = mem.recall("Rust", 10, None, None, None).await.unwrap();
+        let results = mem.recall("Rust", 10, None, None, None, None).await.unwrap();
         // LIKE fallback should still find it
         assert!(
             results.iter().any(|e| e.content.contains("Rust")),
@@ -2763,7 +2765,7 @@ mod tests {
         .await
         .unwrap();
 
-        let results = mem.recall("Rust", 10, None, None, None).await.unwrap();
+        let results = mem.recall("Rust", 10, None, None, None, None).await.unwrap();
         assert!(!results.is_empty(), "Hybrid mode should find results");
     }
 }

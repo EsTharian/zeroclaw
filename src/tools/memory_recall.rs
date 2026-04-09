@@ -1,4 +1,5 @@
 use super::traits::{Tool, ToolResult};
+use crate::config::schema::SearchMode;
 use crate::memory::Memory;
 use async_trait::async_trait;
 use serde_json::json;
@@ -114,7 +115,17 @@ impl Tool for MemoryRecallTool {
             .and_then(serde_json::Value::as_u64)
             .map_or(5, |v| v as usize);
 
-        match self.memory.recall(query, limit, None, since, until).await {
+        let search_mode = args
+            .get("search_mode")
+            .and_then(|v| v.as_str())
+            .and_then(|s| match s {
+                "bm25" => Some(SearchMode::Bm25),
+                "embedding" => Some(SearchMode::Embedding),
+                "hybrid" => Some(SearchMode::Hybrid),
+                _ => None,
+            });
+
+        match self.memory.recall(query, limit, None, since, until, search_mode).await {
             Ok(entries) if entries.is_empty() => Ok(ToolResult {
                 success: true,
                 output: "No memories found.".into(),

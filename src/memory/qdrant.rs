@@ -1,5 +1,6 @@
 use super::embeddings::EmbeddingProvider;
 use super::traits::{Memory, MemoryCategory, MemoryEntry};
+use crate::config::schema::SearchMode;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::Utc;
@@ -293,6 +294,7 @@ impl Memory for QdrantMemory {
         session_id: Option<&str>,
         since: Option<&str>,
         until: Option<&str>,
+        _search_mode: Option<SearchMode>,
     ) -> Result<Vec<MemoryEntry>> {
         if query.trim().is_empty() {
             let mut entries = self.list(None, session_id).await?;

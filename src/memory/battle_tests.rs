@@ -473,7 +473,7 @@ mod tests {
             .unwrap();
 
         // Recall should only return the non-superseded entry
-        let results = mem.recall("prefers", 10, None, None, None).await.unwrap();
+        let results = mem.recall("prefers", 10, None, None, None, None).await.unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].key, "new_pref");
         assert_eq!(results[0].content, "User prefers Rust");
@@ -521,7 +521,7 @@ mod tests {
             .store("k1", "v1", MemoryCategory::Core, None)
             .await
             .unwrap();
-        let _ = audited.recall("query", 10, None, None, None).await;
+        let _ = audited.recall("query", 10, None, None, None, None).await;
         let _ = audited.get("k1").await;
         let _ = audited.list(None, None).await;
         let _ = audited.forget("k1").await;
@@ -573,7 +573,7 @@ mod tests {
         let entry = audited.get("audit_test").await.unwrap().unwrap();
         assert_eq!(entry.content, "audit value");
 
-        let results = audited.recall("audit", 10, None, None, None).await.unwrap();
+        let results = audited.recall("audit", 10, None, None, None, None).await.unwrap();
         assert_eq!(results.len(), 1);
 
         // 3 operations: store, get, recall

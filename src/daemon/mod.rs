@@ -442,7 +442,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
             // Exclude `Conversation` memories to prevent chat context from
             // leaking into scheduled executions (see #5415).
             let memory_context = if let Some(ref mem) = heartbeat_memory {
-                match mem.recall(&task.text, 5, None, None, None).await {
+                match mem.recall(&task.text, 5, None, None, None, None).await {
                     Ok(entries) if !entries.is_empty() => {
                         let ctx: String = entries
                             .iter()

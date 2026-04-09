@@ -22,7 +22,7 @@ pub async fn check_and_resolve_conflicts(
     }
 
     // Search for similar existing entries
-    let candidates = memory.recall(content, 10, None, None, None).await?;
+    let candidates = memory.recall(content, 10, None, None, None, None).await?;
 
     let mut superseded = Vec::new();
     for candidate in &candidates {
