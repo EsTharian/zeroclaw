@@ -1164,10 +1164,11 @@ async fn main() -> Result<()> {
                 Some(zeroclaw::GatewayCommands::GetPaircode { new }) => {
                     let port = config.gateway.port;
                     let host = &config.gateway.host;
+                    let tls_enabled = config.gateway.tls.enabled;
 
                     // Fetch live pairing code from running gateway
                     // If --new is specified, generate a fresh pairing code
-                    match fetch_paircode(host, port, new).await {
+                    match fetch_paircode(host, port, new, tls_enabled).await {
                         Ok(Some(code)) => {
                             println!("🔐 Gateway pairing is enabled.");
                             println!();
@@ -2147,12 +2148,15 @@ async fn shutdown_gateway(host: &str, port: u16) -> Result<()> {
 
 /// Fetch the current pairing code from a running gateway.
 /// If `new` is true, generates a fresh pairing code via POST request.
-async fn fetch_paircode(host: &str, port: u16, new: bool) -> Result<Option<String>> {
-    let client = reqwest::Client::new();
+async fn fetch_paircode(host: &str, port: u16, new: bool, tls_enabled: bool) -> Result<Option<String>> {
+    let scheme = if tls_enabled { "https" } else { "http" };
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(tls_enabled) // accept self-signed certs for local admin calls
+        .build()?;
 
     let response = if new {
         // Generate a new pairing code via POST
-        let url = format!("http://{host}:{port}/admin/paircode/new");
+        let url = format!("{scheme}://{host}:{port}/admin/paircode/new");
         client
             .post(&url)
             .timeout(std::time::Duration::from_secs(5))
@@ -2160,7 +2164,7 @@ async fn fetch_paircode(host: &str, port: u16, new: bool) -> Result<Option<Strin
             .await
     } else {
         // Get existing pairing code via GET
-        let url = format!("http://{host}:{port}/admin/paircode");
+        let url = format!("{scheme}://{host}:{port}/admin/paircode");
         client
             .get(&url)
             .timeout(std::time::Duration::from_secs(5))
