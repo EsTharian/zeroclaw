@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use crate::config::schema::SearchMode;
 use serde::{Deserialize, Serialize};
 
 /// Filter criteria for bulk memory export (GDPR Art. 20 data portability).
@@ -125,6 +126,9 @@ pub trait Memory: Send + Sync {
     /// Recall memories matching a query (keyword search), optionally scoped to a session
     /// and time range. Time bounds use RFC 3339 / ISO 8601 format
     /// (e.g. "2025-03-01T00:00:00Z"); inclusive (created_at >= since, created_at <= until).
+    ///
+    /// `search_mode` overrides the backend's configured default for this call only.
+    /// Pass `None` to use the configured default.
     async fn recall(
         &self,
         query: &str,
@@ -132,6 +136,7 @@ pub trait Memory: Send + Sync {
         session_id: Option<&str>,
         since: Option<&str>,
         until: Option<&str>,
+        search_mode: Option<SearchMode>,
     ) -> anyhow::Result<Vec<MemoryEntry>>;
 
     /// Get a specific memory by key

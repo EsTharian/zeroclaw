@@ -5,6 +5,7 @@
 //! `[memory] audit_enabled = true`.
 
 use super::traits::{Memory, MemoryCategory, MemoryEntry, ProceduralMessage};
+use crate::config::schema::SearchMode;
 use async_trait::async_trait;
 use chrono::Local;
 use parking_lot::Mutex;

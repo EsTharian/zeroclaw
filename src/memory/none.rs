@@ -1,4 +1,5 @@
 use super::traits::{Memory, MemoryCategory, MemoryEntry};
+use crate::config::schema::SearchMode;
 use async_trait::async_trait;
 
 /// Explicit no-op memory backend.
@@ -37,6 +38,7 @@ impl Memory for NoneMemory {
         _session_id: Option<&str>,
         _since: Option<&str>,
         _until: Option<&str>,
+        _search_mode: Option<SearchMode>,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
         Ok(Vec::new())
     }

@@ -8,6 +8,7 @@
 //! namespace, and all recall operations redirect to `recall_namespaced()`.
 
 use super::traits::{Memory, MemoryCategory, MemoryEntry, ProceduralMessage};
+use crate::config::schema::SearchMode;
 use async_trait::async_trait;
 use std::sync::Arc;
 
@@ -65,6 +66,7 @@ impl Memory for NamespacedMemory {
         session_id: Option<&str>,
         since: Option<&str>,
         until: Option<&str>,
+        _search_mode: Option<SearchMode>,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
         self.inner
             .recall_namespaced(&self.namespace, query, limit, session_id, since, until)
