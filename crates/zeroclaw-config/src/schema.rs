@@ -9700,6 +9700,13 @@ impl Config {
             let store = crate::secrets::SecretStore::new(&zeroclaw_dir, config.secrets.encrypt);
             // Decrypt all #[secret]-annotated fields via Configurable derive
             config.decrypt_secrets(&store)?;
+            // Decrypt enc2: values in MCP server headers (not covered by Configurable derive
+            // because McpServerConfig.headers is HashMap<String,String> without #[secret])
+            for server in &mut config.mcp.servers {
+                for value in server.headers.values_mut() {
+                    *value = store.decrypt(value)?;
+                }
+            }
 
             config.apply_env_overrides();
             config.validate()?;

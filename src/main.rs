@@ -729,6 +729,11 @@ enum ConfigCommands {
         /// Partial path to complete
         partial: Option<String>,
     },
+    /// Encrypt a plaintext value using the ZeroClaw secret store (outputs enc2: string)
+    Encrypt {
+        /// Plaintext value to encrypt (e.g. a Bearer token for MCP server headers)
+        value: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -2033,6 +2038,16 @@ async fn main() -> Result<()> {
                         println!("{}", entry.name);
                     }
                 }
+                Ok(())
+            }
+            ConfigCommands::Encrypt { value } => {
+                let config_dir = config
+                    .config_path
+                    .parent()
+                    .context("Config path must have a parent directory")?;
+                let store = security::SecretStore::new(config_dir, config.secrets.encrypt);
+                let encrypted = store.encrypt(&value)?;
+                println!("{encrypted}");
                 Ok(())
             }
         },
