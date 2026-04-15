@@ -1164,7 +1164,7 @@ async fn main() -> Result<()> {
                 Some(zeroclaw::GatewayCommands::GetPaircode { new }) => {
                     let port = config.gateway.port;
                     let host = &config.gateway.host;
-                    let tls_enabled = config.gateway.tls.enabled;
+                    let tls_enabled = config.gateway.tls.as_ref().is_some_and(|t| t.enabled);
 
                     // Fetch live pairing code from running gateway
                     // If --new is specified, generate a fresh pairing code
