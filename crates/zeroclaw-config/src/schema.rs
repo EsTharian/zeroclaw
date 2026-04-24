@@ -1666,6 +1666,10 @@ pub struct SkillsConfig {
     /// Default: `false` (secure by default).
     #[serde(default)]
     pub allow_scripts: bool,
+    /// URL of the skills registry repository for bare-name installs.
+    /// Default: `https://github.com/zeroclaw-labs/zeroclaw-skills`
+    #[serde(default)]
+    pub registry_url: Option<String>,
     /// Controls how skills are injected into the system prompt.
     /// `full` preserves legacy behavior. `compact` keeps context small and loads skills on demand.
     #[serde(default)]
@@ -6545,6 +6549,9 @@ pub struct ChannelsConfig {
     #[cfg(feature = "voice-wake")]
     #[nested]
     pub voice_wake: Option<VoiceWakeConfig>,
+    /// Voice duplex configuration (full-duplex voice over WebSocket).
+    #[nested]
+    pub voice_duplex: Option<VoiceDuplexConfig>,
     /// MQTT channel configuration (SOP listener).
     #[nested]
     pub mqtt: Option<MqttConfig>,
@@ -6773,6 +6780,7 @@ impl Default for ChannelsConfig {
             voice_call: None,
             #[cfg(feature = "voice-wake")]
             voice_wake: None,
+            voice_duplex: None,
             mqtt: None,
             message_timeout_secs: default_channel_message_timeout_secs(),
             ack_reactions: true,
@@ -8595,6 +8603,19 @@ impl ChannelConfig for BlueskyConfig {
     }
 }
 
+/// Voice duplex configuration (`[channels.voice_duplex]`).
+///
+/// Enables full-duplex voice event handling over WebSocket.
+/// When disabled (default), voice events are rejected as unknown types.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct VoiceDuplexConfig {
+    /// Enable full-duplex voice event handling over WebSocket.
+    /// Default: false. When false, voice events are rejected as unknown types.
+    #[serde(default)]
+    pub enabled: bool,
+}
+
 /// Voice wake word detection channel configuration.
 ///
 /// Listens on the default microphone for a configurable wake word,
@@ -9897,7 +9918,16 @@ impl Config {
         }
 
         if let Some(base_url) = base_url {
-            self.providers.fallback = Some(format!("custom:{base_url}"));
+            let canonical_key = format!("custom:{base_url}");
+            // Mirror the profile under the canonical key so runtime
+            // `fallback_provider()` lookups resolve — without this the rename
+            // would orphan the entry still keyed under the original profile name.
+            if !self.providers.models.contains_key(&canonical_key)
+                && let Some(entry) = self.providers.models.get(&profile_key).cloned()
+            {
+                self.providers.models.insert(canonical_key.clone(), entry);
+            }
+            self.providers.fallback = Some(canonical_key);
         }
     }
 
@@ -11725,6 +11755,7 @@ auto_save = true
                 reddit: None,
                 bluesky: None,
                 voice_call: None,
+                voice_duplex: None,
                 #[cfg(feature = "voice-wake")]
                 voice_wake: None,
                 mqtt: None,
@@ -12861,6 +12892,7 @@ allowed_rooms = ["!ops:matrix.org"]
             reddit: None,
             bluesky: None,
             voice_call: None,
+            voice_duplex: None,
             #[cfg(feature = "voice-wake")]
             voice_wake: None,
             mqtt: None,
@@ -13235,6 +13267,7 @@ bot_token = "xoxb-tok"
             reddit: None,
             bluesky: None,
             voice_call: None,
+            voice_duplex: None,
             #[cfg(feature = "voice-wake")]
             voice_wake: None,
             mqtt: None,
@@ -13932,6 +13965,17 @@ requires_openai_auth = true
                 .and_then(|e| e.base_url.as_deref()),
             Some("https://api.tonsof.blue/v1")
         );
+        // The entry is also mirrored under the canonical fallback key so
+        // runtime fallback_provider() lookups resolve.
+        assert_eq!(
+            config
+                .providers
+                .models
+                .get("custom:https://api.tonsof.blue/v1")
+                .and_then(|e| e.base_url.as_deref()),
+            Some("https://api.tonsof.blue/v1")
+        );
+        assert!(config.providers.fallback_provider().is_some());
     }
 
     #[test]
