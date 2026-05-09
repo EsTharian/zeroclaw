@@ -162,6 +162,24 @@ impl std::fmt::Debug for ResolvedEmbeddingConfig {
 /// so that `OPENAI_API_KEY` (etc.) takes precedence over the default-provider key
 /// that the caller passes in. Returns `None` for unknown providers.
 fn embedding_provider_env_key(provider: &str) -> Option<String> {
+    // Google's API uses two common env-var names depending on which SDK is
+    // doing the calling (`GOOGLE_API_KEY` is the genai SDK default,
+    // `GEMINI_API_KEY` is what AI Studio prints). Try both before giving
+    // up so the caller-supplied chat-provider key (likely Anthropic /
+    // OpenAI) doesn't leak into Gemini's embedding endpoint and produce
+    // the misleading 400 "invalid Authorization header" — same class of
+    // bug as issue #3083 in the inverse direction.
+    if matches!(provider.trim(), "google" | "gemini") {
+        for name in ["GOOGLE_API_KEY", "GEMINI_API_KEY"] {
+            if let Ok(v) = std::env::var(name) {
+                let trimmed = v.trim().to_string();
+                if !trimmed.is_empty() {
+                    return Some(trimmed);
+                }
+            }
+        }
+        return None;
+    }
     let env_var = match provider.trim() {
         "openai" => "OPENAI_API_KEY",
         "openrouter" => "OPENROUTER_API_KEY",
