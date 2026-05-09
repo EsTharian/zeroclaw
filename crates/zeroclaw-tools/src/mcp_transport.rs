@@ -1,16 +1,17 @@
 //! MCP transport abstraction — supports stdio, SSE, and HTTP transports.
 
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, Notify, oneshot};
-use tokio::time::{Duration, timeout};
+use tokio::time::{Duration, Instant, timeout};
 use tokio_stream::StreamExt;
 
 use crate::mcp_protocol::{INTERNAL_ERROR, JsonRpcError, JsonRpcRequest, JsonRpcResponse};
-use zeroclaw_config::schema::{McpServerConfig, McpTransport};
+use zeroclaw_config::schema::{McpOAuthConfig, McpServerConfig, McpTransport};
 
 /// Maximum bytes for a single JSON-RPC response.
 const MAX_LINE_BYTES: usize = 4 * 1024 * 1024; // 4 MB
@@ -25,6 +26,145 @@ const MCP_STREAMABLE_ACCEPT: &str = "application/json, text/event-stream";
 const MCP_JSON_CONTENT_TYPE: &str = "application/json";
 /// Streamable HTTP session header used to preserve MCP server state.
 const MCP_SESSION_ID_HEADER: &str = "Mcp-Session-Id";
+
+/// Default number of seconds before `expires_in` when we proactively refresh
+/// the cached token, masking clock skew between client and auth server.
+const DEFAULT_TOKEN_REFRESH_SKEW_SECS: u64 = 60;
+
+/// Floor applied to the auth-server-reported `expires_in` — if the AS issues
+/// a token shorter than this, we still treat it as valid for this long to
+/// avoid hammering the token endpoint in a pathological loop.
+const MIN_TOKEN_LIFETIME_SECS: u64 = 30;
+
+// ── OAuth 2.1 client_credentials Token Provider ─────────────────────────
+
+#[derive(Debug, Clone)]
+struct CachedToken {
+    value: String,
+    /// Moment at which the cached token must be refreshed (already reduced by skew).
+    refresh_at: Instant,
+}
+
+/// Mints and caches `Authorization: Bearer` tokens for an HTTP/SSE MCP
+/// transport using OAuth 2.1 `client_credentials`. Shared via `Arc` so the
+/// transport can be cloned cheaply and so concurrent requests serialise on
+/// the refresh path.
+pub struct OAuthTokenProvider {
+    config: McpOAuthConfig,
+    client: reqwest::Client,
+    cached: Mutex<Option<CachedToken>>,
+}
+
+impl OAuthTokenProvider {
+    pub fn new(config: McpOAuthConfig) -> Result<Arc<Self>> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .context("failed to build OAuth HTTP client")?;
+        Ok(Arc::new(Self {
+            config,
+            client,
+            cached: Mutex::new(None),
+        }))
+    }
+
+    /// Return a valid bearer token, minting or refreshing as needed. The
+    /// mutex is held across the network call so two concurrent requests
+    /// cannot each trigger a separate mint — the second waits and reads
+    /// the value the first one stored.
+    pub async fn get_token(&self) -> Result<String> {
+        let mut guard = self.cached.lock().await;
+        if let Some(token) = guard.as_ref()
+            && Instant::now() < token.refresh_at
+        {
+            return Ok(token.value.clone());
+        }
+
+        let minted = self.mint_token().await?;
+        let value = minted.value.clone();
+        *guard = Some(minted);
+        Ok(value)
+    }
+
+    async fn mint_token(&self) -> Result<CachedToken> {
+        let mut form: Vec<(&str, &str)> = vec![("grant_type", "client_credentials")];
+        if let Some(resource) = self.config.resource.as_deref()
+            && !resource.is_empty()
+        {
+            form.push(("resource", resource));
+        }
+        if let Some(scope) = self.config.scope.as_deref()
+            && !scope.is_empty()
+        {
+            form.push(("scope", scope));
+        }
+
+        let resp = self
+            .client
+            .post(&self.config.token_url)
+            .basic_auth(&self.config.client_id, Some(&self.config.client_secret))
+            .header("Accept", "application/json")
+            .form(&form)
+            .send()
+            .await
+            .with_context(|| {
+                format!("token request to `{}` failed", self.config.token_url)
+            })?;
+
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            bail!(
+                "token endpoint returned HTTP {} for client `{}`: {}",
+                status,
+                self.config.client_id,
+                body
+            );
+        }
+
+        let parsed: TokenResponse = serde_json::from_str(&body).with_context(|| {
+            format!(
+                "failed to parse token response from `{}`: {}",
+                self.config.token_url, body
+            )
+        })?;
+
+        let skew = self
+            .config
+            .refresh_skew_secs
+            .unwrap_or(DEFAULT_TOKEN_REFRESH_SKEW_SECS);
+        let lifetime = parsed.expires_in.max(MIN_TOKEN_LIFETIME_SECS);
+        let usable = lifetime.saturating_sub(skew).max(MIN_TOKEN_LIFETIME_SECS / 2);
+        let refresh_at = Instant::now() + Duration::from_secs(usable);
+
+        Ok(CachedToken {
+            value: parsed.access_token,
+            refresh_at,
+        })
+    }
+
+    /// Force a refresh on next `get_token()`. Call this after an MCP request
+    /// comes back 401 so we don't keep resending a revoked token.
+    pub async fn invalidate(&self) {
+        *self.cached.lock().await = None;
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct TokenResponse {
+    access_token: String,
+    #[serde(default = "default_expires_in")]
+    expires_in: u64,
+    // token_type and scope are present on RFC-compliant servers but we do
+    // not need them: we always mint fresh via client_credentials so scope
+    // negotiation is a no-op, and token_type is always "Bearer".
+}
+
+fn default_expires_in() -> u64 {
+    // If the AS omits `expires_in`, assume a conservative 5 min so we refresh
+    // often rather than trust an unbounded lifetime.
+    300
+}
 
 // ── Transport Trait ──────────────────────────────────────────────────────
 
@@ -152,6 +292,7 @@ pub struct HttpTransport {
     client: reqwest::Client,
     headers: std::collections::HashMap<String, String>,
     session_id: Option<String>,
+    oauth: Option<Arc<OAuthTokenProvider>>,
 }
 
 impl HttpTransport {
@@ -167,11 +308,17 @@ impl HttpTransport {
             .build()
             .context("failed to build HTTP client")?;
 
+        let oauth = match config.oauth.as_ref() {
+            Some(cfg) => Some(OAuthTokenProvider::new(cfg.clone())?),
+            None => None,
+        };
+
         Ok(Self {
             url,
             client,
             headers: config.headers.clone(),
             session_id: None,
+            oauth,
         })
     }
 
@@ -208,13 +355,23 @@ impl McpTransportConn for HttpTransport {
             .headers
             .keys()
             .any(|k| k.eq_ignore_ascii_case("Content-Type"));
+        // When OAuth is configured, its Bearer token is authoritative —
+        // any user-supplied static `Authorization` header is ignored.
+        let suppress_static_auth = self.oauth.is_some();
 
         let mut req = self.client.post(&self.url).body(body);
         if !has_content_type {
             req = req.header("Content-Type", MCP_JSON_CONTENT_TYPE);
         }
         for (key, value) in &self.headers {
+            if suppress_static_auth && key.eq_ignore_ascii_case("Authorization") {
+                continue;
+            }
             req = req.header(key, value);
+        }
+        if let Some(provider) = self.oauth.as_ref() {
+            let token = provider.get_token().await?;
+            req = req.header("Authorization", format!("Bearer {token}"));
         }
         req = self.apply_session_header(req);
         if !has_accept {
@@ -226,8 +383,17 @@ impl McpTransportConn for HttpTransport {
             .await
             .context("HTTP request to MCP server failed")?;
 
-        if !resp.status().is_success() {
-            bail!("MCP server returned HTTP {}", resp.status());
+        let status = resp.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED
+            && let Some(provider) = self.oauth.as_ref()
+        {
+            // Token almost certainly expired between our skew window and
+            // the server's view of the clock, or was revoked server-side.
+            // Drop the cache so the next request mints a fresh one.
+            provider.invalidate().await;
+        }
+        if !status.is_success() {
+            bail!("MCP server returned HTTP {}", status);
         }
 
         self.update_session_id_from_headers(resp.headers());
@@ -281,6 +447,7 @@ pub struct SseTransport {
     server_name: String,
     client: reqwest::Client,
     headers: std::collections::HashMap<String, String>,
+    oauth: Option<Arc<OAuthTokenProvider>>,
     stream_state: SseStreamState,
     shared: std::sync::Arc<Mutex<SseSharedState>>,
     notify: std::sync::Arc<Notify>,
@@ -300,11 +467,17 @@ impl SseTransport {
             .build()
             .context("failed to build HTTP client")?;
 
+        let oauth = match config.oauth.as_ref() {
+            Some(cfg) => Some(OAuthTokenProvider::new(cfg.clone())?),
+            None => None,
+        };
+
         Ok(Self {
             sse_url,
             server_name: config.name.clone(),
             client,
             headers: config.headers.clone(),
+            oauth,
             stream_state: SseStreamState::Unknown,
             shared: std::sync::Arc::new(Mutex::new(SseSharedState::default())),
             notify: std::sync::Arc::new(Notify::new()),
@@ -328,13 +501,21 @@ impl SseTransport {
             .headers
             .keys()
             .any(|k| k.eq_ignore_ascii_case("Accept"));
+        let suppress_static_auth = self.oauth.is_some();
 
         let mut req = self
             .client
             .get(&self.sse_url)
             .header("Cache-Control", "no-cache");
         for (key, value) in &self.headers {
+            if suppress_static_auth && key.eq_ignore_ascii_case("Authorization") {
+                continue;
+            }
             req = req.header(key, value);
+        }
+        if let Some(provider) = self.oauth.as_ref() {
+            let token = provider.get_token().await?;
+            req = req.header("Authorization", format!("Bearer {token}"));
         }
         if !has_accept {
             req = req.header("Accept", MCP_STREAMABLE_ACCEPT);
@@ -773,6 +954,7 @@ impl McpTransportConn for SseTransport {
                 .headers
                 .keys()
                 .any(|k| k.eq_ignore_ascii_case("Content-Type"));
+            let suppress_static_auth = self.oauth.is_some();
             let mut req = self
                 .client
                 .post(&url)
@@ -782,7 +964,14 @@ impl McpTransportConn for SseTransport {
                 req = req.header("Content-Type", MCP_JSON_CONTENT_TYPE);
             }
             for (key, value) in &self.headers {
+                if suppress_static_auth && key.eq_ignore_ascii_case("Authorization") {
+                    continue;
+                }
                 req = req.header(key, value);
+            }
+            if let Some(provider) = self.oauth.as_ref() {
+                let token = provider.get_token().await?;
+                req = req.header("Authorization", format!("Bearer {token}"));
             }
             if !has_accept {
                 req = req.header("Accept", MCP_STREAMABLE_ACCEPT);
@@ -791,6 +980,12 @@ impl McpTransportConn for SseTransport {
             let resp = req.send().await.context("SSE POST to MCP server failed")?;
             let status = resp.status();
             last_status = Some(status);
+
+            if status == reqwest::StatusCode::UNAUTHORIZED
+                && let Some(provider) = self.oauth.as_ref()
+            {
+                provider.invalidate().await;
+            }
 
             if (status == reqwest::StatusCode::NOT_FOUND
                 || status == reqwest::StatusCode::METHOD_NOT_ALLOWED)
@@ -1279,5 +1474,205 @@ mod tests {
             .build()
             .expect("build request");
         assert!(req.headers().get(MCP_SESSION_ID_HEADER).is_none());
+    }
+
+    // ── OAuth client_credentials provider ────────────────────────────────
+
+    fn make_oauth_cfg(token_url: String) -> McpOAuthConfig {
+        McpOAuthConfig {
+            token_url,
+            client_id: "zc-test".into(),
+            client_secret: "super-secret".into(),
+            resource: Some("https://api.example.com/v1".into()),
+            scope: Some("read:things".into()),
+            refresh_skew_secs: Some(1),
+        }
+    }
+
+    #[tokio::test]
+    async fn oauth_provider_mints_and_caches_token() {
+        use wiremock::matchers::{body_string_contains, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // Basic auth for zc-test:super-secret → base64("zc-test:super-secret")
+        // = emMtdGVzdDpzdXBlci1zZWNyZXQ=
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .and(header(
+                "authorization",
+                "Basic emMtdGVzdDpzdXBlci1zZWNyZXQ=",
+            ))
+            .and(body_string_contains("grant_type=client_credentials"))
+            .and(body_string_contains("resource=https"))
+            .and(body_string_contains("scope=read"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "jwt.value.abc",
+                "token_type": "Bearer",
+                "expires_in": 3600
+            })))
+            .expect(1) // Second get_token() must reuse the cache.
+            .mount(&server)
+            .await;
+
+        let provider = OAuthTokenProvider::new(make_oauth_cfg(format!(
+            "{}/oauth/token",
+            server.uri()
+        )))
+        .expect("build provider");
+
+        let t1 = provider.get_token().await.expect("first mint");
+        let t2 = provider.get_token().await.expect("cache hit");
+        assert_eq!(t1, "jwt.value.abc");
+        assert_eq!(t2, t1);
+    }
+
+    #[tokio::test]
+    async fn oauth_provider_refreshes_after_invalidate() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // First call returns A, second call returns B — we verify that
+        // invalidate() forces the second mint.
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "token-A",
+                "expires_in": 3600
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "token-B",
+                "expires_in": 3600
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = OAuthTokenProvider::new(make_oauth_cfg(format!(
+            "{}/oauth/token",
+            server.uri()
+        )))
+        .expect("build provider");
+        assert_eq!(provider.get_token().await.unwrap(), "token-A");
+        provider.invalidate().await;
+        assert_eq!(provider.get_token().await.unwrap(), "token-B");
+    }
+
+    #[tokio::test]
+    async fn oauth_provider_surfaces_token_endpoint_errors() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(
+                ResponseTemplate::new(401)
+                    .set_body_string(r#"{"error":"invalid_client"}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = OAuthTokenProvider::new(make_oauth_cfg(format!(
+            "{}/oauth/token",
+            server.uri()
+        )))
+        .expect("build provider");
+        let err = provider.get_token().await.expect_err("should fail on 401");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("HTTP 401") || msg.contains("invalid_client"),
+            "got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_transport_injects_bearer_token_from_oauth_provider() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let as_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "injected-jwt",
+                "expires_in": 3600
+            })))
+            .mount(&as_server)
+            .await;
+
+        let mcp_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .and(header("authorization", "Bearer injected-jwt"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 42,
+                "result": {"ok": true}
+            })))
+            .mount(&mcp_server)
+            .await;
+
+        let config = McpServerConfig {
+            name: "oauth-http".into(),
+            transport: McpTransport::Http,
+            url: Some(format!("{}/mcp", mcp_server.uri())),
+            oauth: Some(make_oauth_cfg(format!("{}/oauth/token", as_server.uri()))),
+            ..Default::default()
+        };
+        let mut transport = HttpTransport::new(&config).expect("build transport");
+        let req = JsonRpcRequest::new(42, "ping", serde_json::json!({}));
+        let resp = transport.send_and_recv(&req).await.expect("send");
+        assert_eq!(resp.id, Some(serde_json::json!(42)));
+        assert!(resp.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn http_transport_oauth_overrides_static_authorization_header() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let as_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "fresh-jwt",
+                "expires_in": 3600
+            })))
+            .mount(&as_server)
+            .await;
+
+        let mcp_server = MockServer::start().await;
+        // The mock ONLY accepts the OAuth-minted bearer. If the static
+        // "stale" header leaked through, this request would never match.
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .and(header("authorization", "Bearer fresh-jwt"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 7,
+                "result": {}
+            })))
+            .mount(&mcp_server)
+            .await;
+
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("Authorization".to_string(), "Bearer stale".to_string());
+        let config = McpServerConfig {
+            name: "oauth-http".into(),
+            transport: McpTransport::Http,
+            url: Some(format!("{}/mcp", mcp_server.uri())),
+            headers,
+            oauth: Some(make_oauth_cfg(format!("{}/oauth/token", as_server.uri()))),
+            ..Default::default()
+        };
+        let mut transport = HttpTransport::new(&config).expect("build transport");
+        let req = JsonRpcRequest::new(7, "ping", serde_json::json!({}));
+        transport.send_and_recv(&req).await.expect("send");
     }
 }

@@ -308,12 +308,8 @@ mod tests {
         let config = McpServerConfig {
             name: "nonexistent".to_string(),
             command: "/usr/bin/this_binary_does_not_exist_zeroclaw_test".to_string(),
-            args: vec![],
-            env: std::collections::HashMap::default(),
-            tool_timeout_secs: None,
             transport: McpTransport::Stdio,
-            url: None,
-            headers: std::collections::HashMap::default(),
+            ..Default::default()
         };
         let result = McpServer::connect(config).await;
         assert!(result.is_err());
@@ -327,12 +323,8 @@ mod tests {
         let configs = vec![McpServerConfig {
             name: "bad".to_string(),
             command: "/usr/bin/does_not_exist_zc_test".to_string(),
-            args: vec![],
-            env: std::collections::HashMap::default(),
-            tool_timeout_secs: None,
             transport: McpTransport::Stdio,
-            url: None,
-            headers: std::collections::HashMap::default(),
+            ..Default::default()
         }];
         let registry = McpRegistry::connect_all(&configs)
             .await

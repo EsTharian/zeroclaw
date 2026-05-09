@@ -952,6 +952,37 @@ pub enum McpTransport {
     Sse,
 }
 
+/// OAuth 2.1 `client_credentials` configuration for an HTTP/SSE MCP server.
+///
+/// When present, the transport mints and refreshes an access token via
+/// `token_url` and injects `Authorization: Bearer <jwt>` on every request.
+/// Supersedes any static `Authorization` entry in `headers`.
+///
+/// `client_secret` is stored encrypted on disk (`enc2:` prefix) and
+/// decrypted in memory at config-load time, matching the existing pattern
+/// for static header secrets.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct McpOAuthConfig {
+    /// OAuth 2.1 token endpoint, e.g. `https://qauth.example/oauth/token`.
+    pub token_url: String,
+    /// Client identifier issued at registration.
+    pub client_id: String,
+    /// Client secret (plaintext at runtime; `enc2:`-encrypted on disk).
+    pub client_secret: String,
+    /// RFC 8707 resource indicator. When set, the transport requests tokens
+    /// scoped to this resource URI so the AS can issue `aud`-bound JWTs.
+    #[serde(default)]
+    pub resource: Option<String>,
+    /// Space-separated OAuth scopes requested on each token mint.
+    #[serde(default)]
+    pub scope: Option<String>,
+    /// Refresh the cached token this many seconds before its `expires_in`.
+    /// Default: 60s.
+    #[serde(default)]
+    pub refresh_skew_secs: Option<u64>,
+}
+
 /// Configuration for a single external MCP server.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -976,6 +1007,10 @@ pub struct McpServerConfig {
     /// Optional HTTP headers for HTTP/SSE transports.
     #[serde(default)]
     pub headers: HashMap<String, String>,
+    /// Optional OAuth client_credentials block for HTTP/SSE transports.
+    /// When present, the transport injects a Bearer JWT that is auto-refreshed.
+    #[serde(default)]
+    pub oauth: Option<McpOAuthConfig>,
     /// Optional per-call timeout in seconds (hard capped in validation).
     #[serde(default)]
     pub tool_timeout_secs: Option<u64>,
@@ -4359,6 +4394,11 @@ fn validate_mcp_config(config: &McpConfig) -> Result<()> {
                         "mcp.servers[{i}] with transport=stdio requires non-empty command"
                     );
                 }
+                if server.oauth.is_some() {
+                    anyhow::bail!(
+                        "mcp.servers[{i}].oauth is only supported with transport=http or sse"
+                    );
+                }
             }
             McpTransport::Http | McpTransport::Sse => {
                 let url = server
@@ -4380,6 +4420,37 @@ fn validate_mcp_config(config: &McpConfig) -> Result<()> {
                     .with_context(|| format!("mcp.servers[{i}].url is not a valid URL"))?;
                 if !matches!(parsed.scheme(), "http" | "https") {
                     anyhow::bail!("mcp.servers[{i}].url must use http/https");
+                }
+
+                if let Some(oauth) = server.oauth.as_ref() {
+                    if oauth.client_id.trim().is_empty() {
+                        anyhow::bail!("mcp.servers[{i}].oauth.client_id must not be empty");
+                    }
+                    if oauth.client_secret.trim().is_empty() {
+                        anyhow::bail!("mcp.servers[{i}].oauth.client_secret must not be empty");
+                    }
+                    let token_url = oauth.token_url.trim();
+                    if token_url.is_empty() {
+                        anyhow::bail!("mcp.servers[{i}].oauth.token_url must not be empty");
+                    }
+                    let parsed_token = reqwest::Url::parse(token_url).with_context(|| {
+                        format!("mcp.servers[{i}].oauth.token_url is not a valid URL")
+                    })?;
+                    if !matches!(parsed_token.scheme(), "http" | "https") {
+                        anyhow::bail!("mcp.servers[{i}].oauth.token_url must use http/https");
+                    }
+                    if let Some(resource) = oauth.resource.as_deref()
+                        && !resource.is_empty()
+                    {
+                        let parsed_res = reqwest::Url::parse(resource).with_context(|| {
+                            format!("mcp.servers[{i}].oauth.resource is not a valid URL")
+                        })?;
+                        if !matches!(parsed_res.scheme(), "http" | "https") {
+                            anyhow::bail!(
+                                "mcp.servers[{i}].oauth.resource must use http/https"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -9753,11 +9824,15 @@ impl Config {
             let store = crate::secrets::SecretStore::new(&zeroclaw_dir, config.secrets.encrypt);
             // Decrypt all #[secret]-annotated fields via Configurable derive
             config.decrypt_secrets(&store)?;
-            // Decrypt enc2: values in MCP server headers (not covered by Configurable derive
-            // because McpServerConfig.headers is HashMap<String,String> without #[secret])
+            // Decrypt enc2: values in MCP server headers and OAuth client_secret (not covered
+            // by the Configurable derive because McpServerConfig lives inside a
+            // `Vec<McpServerConfig>`, which the macro does not walk).
             for server in &mut config.mcp.servers {
                 for value in server.headers.values_mut() {
                     *value = store.decrypt(value)?;
+                }
+                if let Some(oauth) = server.oauth.as_mut() {
+                    oauth.client_secret = store.decrypt(&oauth.client_secret)?;
                 }
             }
 
@@ -16087,6 +16162,91 @@ require_otp_to_resume = true
         };
         let err = validate_mcp_config(&cfg).expect_err("invalid url should fail");
         assert!(err.to_string().contains("valid URL"), "got: {err}");
+    }
+
+    fn oauth_ok() -> McpOAuthConfig {
+        McpOAuthConfig {
+            token_url: "https://auth.example.com/oauth/token".into(),
+            client_id: "client-abc".into(),
+            client_secret: "shhh".into(),
+            resource: Some("https://api.example.com/v1".into()),
+            scope: Some("read:things".into()),
+            refresh_skew_secs: None,
+        }
+    }
+
+    #[test]
+    async fn validate_mcp_config_accepts_http_with_oauth_block() {
+        let mut server = http_server("svc", "https://api.example.com/mcp");
+        server.oauth = Some(oauth_ok());
+        let cfg = McpConfig {
+            enabled: true,
+            servers: vec![server],
+            ..Default::default()
+        };
+        assert!(validate_mcp_config(&cfg).is_ok());
+    }
+
+    #[test]
+    async fn validate_mcp_config_rejects_oauth_on_stdio_transport() {
+        let mut server = stdio_server("svc", "/usr/bin/mcp");
+        server.oauth = Some(oauth_ok());
+        let cfg = McpConfig {
+            enabled: true,
+            servers: vec![server],
+            ..Default::default()
+        };
+        let err =
+            validate_mcp_config(&cfg).expect_err("oauth on stdio transport should be rejected");
+        assert!(
+            err.to_string().contains("oauth is only supported"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    async fn validate_mcp_config_rejects_oauth_with_empty_client_id() {
+        let mut server = http_server("svc", "https://api.example.com/mcp");
+        let mut oauth = oauth_ok();
+        oauth.client_id = "".into();
+        server.oauth = Some(oauth);
+        let cfg = McpConfig {
+            enabled: true,
+            servers: vec![server],
+            ..Default::default()
+        };
+        let err = validate_mcp_config(&cfg).expect_err("empty client_id should fail");
+        assert!(err.to_string().contains("client_id"), "got: {err}");
+    }
+
+    #[test]
+    async fn validate_mcp_config_rejects_oauth_with_bad_token_url_scheme() {
+        let mut server = http_server("svc", "https://api.example.com/mcp");
+        let mut oauth = oauth_ok();
+        oauth.token_url = "ftp://auth.example.com/token".into();
+        server.oauth = Some(oauth);
+        let cfg = McpConfig {
+            enabled: true,
+            servers: vec![server],
+            ..Default::default()
+        };
+        let err = validate_mcp_config(&cfg).expect_err("non-http token_url should fail");
+        assert!(err.to_string().contains("http/https"), "got: {err}");
+    }
+
+    #[test]
+    async fn validate_mcp_config_rejects_oauth_with_bad_resource_url() {
+        let mut server = http_server("svc", "https://api.example.com/mcp");
+        let mut oauth = oauth_ok();
+        oauth.resource = Some("not-a-url".into());
+        server.oauth = Some(oauth);
+        let cfg = McpConfig {
+            enabled: true,
+            servers: vec![server],
+            ..Default::default()
+        };
+        let err = validate_mcp_config(&cfg).expect_err("invalid resource URL should fail");
+        assert!(err.to_string().contains("resource"), "got: {err}");
     }
 
     #[test]
