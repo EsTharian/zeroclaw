@@ -43,6 +43,10 @@ export interface CronJob {
   enabled: boolean;
   delivery: unknown;
   delete_after_run: boolean;
+  session_target: string | null;
+  model: string | null;
+  allowed_tools: string[] | null;
+  source: string | null;
   created_at: string;
   next_run: string;
   last_run: string | null;
@@ -64,7 +68,7 @@ export interface Integration {
   name: string;
   description: string;
   category: string;
-  status: 'Available' | 'Active' | 'ComingSoon';
+  status: 'Available' | 'Active';
 }
 
 export interface DiagResult {

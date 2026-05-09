@@ -41,7 +41,7 @@ async fn memory_persists_across_instances() {
     // Instance 2: recall (simulates restart)
     {
         let mem = SqliteMemory::new(tmp.path()).unwrap();
-        let results = mem.recall("deadline", 5, None, None, None).await.unwrap();
+        let results = mem.recall("deadline", 5, None, None, None, None).await.unwrap();
         assert!(
             !results.is_empty(),
             "Memory should survive instance restart"
@@ -80,13 +80,13 @@ async fn memory_recall_returns_relevant_entries() {
     .await
     .unwrap();
 
-    let results = mem.recall("Argenis", 5, None, None, None).await.unwrap();
+    let results = mem.recall("Argenis", 5, None, None, None, None).await.unwrap();
     assert!(
         results.iter().any(|e| e.content.contains("Argenis")),
         "Recall for 'Argenis' should find the name entry"
     );
 
-    let results = mem.recall("Rust", 5, None, None, None).await.unwrap();
+    let results = mem.recall("Rust", 5, None, None, None, None).await.unwrap();
     assert!(
         results.iter().any(|e| e.content.contains("Rust")),
         "Recall for 'Rust' should find the language preference"
@@ -107,26 +107,31 @@ async fn agent_completes_five_step_tool_chain() {
             id: "tc1".into(),
             name: "counter".into(),
             arguments: "{}".into(),
+            extra_content: None,
         }]),
         tool_response(vec![ToolCall {
             id: "tc2".into(),
             name: "counter".into(),
             arguments: "{}".into(),
+            extra_content: None,
         }]),
         tool_response(vec![ToolCall {
             id: "tc3".into(),
             name: "counter".into(),
             arguments: "{}".into(),
+            extra_content: None,
         }]),
         tool_response(vec![ToolCall {
             id: "tc4".into(),
             name: "counter".into(),
             arguments: "{}".into(),
+            extra_content: None,
         }]),
         tool_response(vec![ToolCall {
             id: "tc5".into(),
             name: "counter".into(),
             arguments: "{}".into(),
+            extra_content: None,
         }]),
         text_response("All 5 steps completed successfully"),
     ]));
@@ -259,7 +264,7 @@ async fn compressor_with_memory_saves_summary() {
         if compressed.compressed {
             // Verify the summary was saved to memory
             let entries = mem
-                .recall("multiplication", 10, None, None, None)
+                .recall("multiplication", 10, None, None, None, None)
                 .await
                 .unwrap();
             assert!(
@@ -284,12 +289,14 @@ async fn agent_handles_interleaved_tools_and_text() {
             id: "tc1".into(),
             name: "echo".into(),
             arguments: r#"{"message": "creating file"}"#.into(),
+            extra_content: None,
         }]),
         // Step 2: another tool call
         tool_response(vec![ToolCall {
             id: "tc2".into(),
             name: "echo".into(),
             arguments: r#"{"message": "reading file"}"#.into(),
+            extra_content: None,
         }]),
         // Step 3: final text
         text_response("File created and read successfully"),
@@ -340,6 +347,7 @@ async fn agent_survives_large_tool_output() {
             id: "tc1".into(),
             name: "large_output".into(),
             arguments: "{}".into(),
+            extra_content: None,
         }]),
         text_response("Processed the large output successfully"),
     ]));
@@ -366,16 +374,19 @@ async fn agent_handles_parallel_tool_calls() {
                 id: "tc1".into(),
                 name: "counter".into(),
                 arguments: "{}".into(),
+                extra_content: None,
             },
             ToolCall {
                 id: "tc2".into(),
                 name: "counter".into(),
                 arguments: "{}".into(),
+                extra_content: None,
             },
             ToolCall {
                 id: "tc3".into(),
                 name: "counter".into(),
                 arguments: "{}".into(),
+                extra_content: None,
             },
         ]),
         text_response("All three parallel tools completed"),
@@ -405,6 +416,7 @@ async fn agent_multi_turn_with_tools_builds_context() {
             id: "tc1".into(),
             name: "counter".into(),
             arguments: "{}".into(),
+            extra_content: None,
         }]),
         text_response("Step 1 complete. Counter is at 1."),
         // Turn 2: another tool + response
@@ -412,6 +424,7 @@ async fn agent_multi_turn_with_tools_builds_context() {
             id: "tc2".into(),
             name: "counter".into(),
             arguments: "{}".into(),
+            extra_content: None,
         }]),
         text_response("Step 2 complete. Counter is at 2."),
         // Turn 3: final response referencing prior turns
@@ -464,7 +477,7 @@ async fn consolidation_extracts_facts_to_memory() {
     assert!(result.is_ok(), "Consolidation should succeed");
 
     // Check that facts were stored
-    let entries = mem.recall("deadline", 10, None, None, None).await.unwrap();
+    let entries = mem.recall("deadline", 10, None, None, None, None).await.unwrap();
     assert!(
         !entries.is_empty(),
         "Consolidation should have stored facts about the deadline"
@@ -495,7 +508,7 @@ async fn memory_survives_rapid_consolidation() {
 
     // All daily entries should exist
     let entries = mem
-        .recall("conversation", 20, None, None, None)
+        .recall("conversation", 20, None, None, None, None)
         .await
         .unwrap();
     assert!(

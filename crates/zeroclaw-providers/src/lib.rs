@@ -7,7 +7,7 @@
 //! so that user-facing keys remain stable.
 //!
 //! The subsystem supports resilient multi-provider configurations through the
-//! [`ReliableProvider`](reliable::ReliableProvider) wrapper, which handles fallback
+//! [`ReliableProvider`] wrapper, which handles fallback
 //! chains and automatic retry. Model routing across providers is available via
 //! [`create_routed_provider`].
 //!
@@ -27,6 +27,8 @@ pub mod gemini;
 pub mod gemini_cli;
 // glm.rs excluded — not compiled in upstream (dead code with known issues)
 pub mod kilocli;
+pub mod llamacpp;
+pub mod models_dev;
 pub mod multimodal;
 pub mod ollama;
 pub mod openai;
@@ -66,6 +68,8 @@ const GLM_GLOBAL_BASE_URL: &str = "https://api.z.ai/api/paas/v4";
 const GLM_CN_BASE_URL: &str = "https://open.bigmodel.cn/api/paas/v4";
 const MOONSHOT_INTL_BASE_URL: &str = "https://api.moonshot.ai/v1";
 const MOONSHOT_CN_BASE_URL: &str = "https://api.moonshot.cn/v1";
+const STEPFUN_CN_BASE_URL: &str = "https://api.stepfun.com/v1";
+const STEPFUN_INTL_BASE_URL: &str = "https://api.stepfun.ai/v1";
 const QWEN_CN_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
 const QWEN_INTL_BASE_URL: &str = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1";
 const QWEN_US_BASE_URL: &str = "https://dashscope-us.aliyuncs.com/compatible-mode/v1";
@@ -716,6 +720,39 @@ pub struct ProviderRuntimeOptions {
     /// Extra JSON parameters merged into API request bodies at the top level.
     /// Propagated from `ModelProviderConfig::provider_extra`.
     pub provider_extra: Option<serde_json::Value>,
+    /// Override the provider's default for native tool calling. `None` honors
+    /// the per-provider built-in choice. `Some(true)` forces native tool
+    /// calls on; `Some(false)` forces text-fallback. Propagated from
+    /// `ModelProviderConfig::native_tools`. Currently consulted only by the
+    /// Groq factory branch (#5932).
+    pub native_tools: Option<bool>,
+    /// Wire protocol to use for this provider.
+    /// `Some("responses")` routes the provider through the OpenResponses
+    /// `/v1/responses` API instead of chat_completions.  `None` uses the
+    /// provider's built-in default (chat_completions for most providers).
+    pub wire_api: Option<String>,
+    /// Enable or disable chain-of-thought thinking. Forwarded as
+    /// `enable_thinking` in the request body. `None` lets the model decide.
+    pub think: Option<bool>,
+    /// Passed verbatim as `chat_template_kwargs` to the llamacpp provider.
+    pub chat_template_kwargs: Option<serde_json::Value>,
+    /// Override for the Ollama `num_ctx` request option. Only consumed by
+    /// the `ollama` factory arm. `None` falls back to the framework
+    /// default constant.
+    pub ollama_num_ctx: Option<u32>,
+    /// Override for the Ollama `num_predict` request option. Only consumed
+    /// by the `ollama` factory arm. `None` falls back to the framework
+    /// default constant.
+    pub ollama_num_predict: Option<i32>,
+    /// Override the temperature sent on every Ollama `/api/chat` request.
+    /// Only consumed by the `ollama` factory arm. When `None` (default), the
+    /// per-call temperature passed through `Provider::chat_with_system`
+    /// wins — this field is preserved as `None` straight through to
+    /// `OllamaTuning::temperature_override`, and the request builder uses
+    /// `temperature_override.unwrap_or(temperature)`. When `Some(v)`, every
+    /// request to this Ollama provider uses `v` regardless of the per-call
+    /// argument. There is no framework-constant fallback for this field.
+    pub ollama_temperature_override: Option<f64>,
 }
 
 impl Default for ProviderRuntimeOptions {
@@ -733,6 +770,13 @@ impl Default for ProviderRuntimeOptions {
             provider_max_tokens: None,
             merge_system_into_user: false,
             provider_extra: None,
+            native_tools: None,
+            wire_api: None,
+            think: None,
+            chat_template_kwargs: None,
+            ollama_num_ctx: None,
+            ollama_num_predict: None,
+            ollama_temperature_override: None,
         }
     }
 }
@@ -776,6 +820,13 @@ pub fn provider_runtime_options_from_config(
         provider_max_tokens: fallback.and_then(|e| e.max_tokens),
         merge_system_into_user,
         provider_extra: fallback.and_then(|e| e.provider_extra.clone()),
+        native_tools: fallback.and_then(|e| e.native_tools),
+        wire_api: fallback.and_then(|e| e.wire_api.clone()),
+        think: fallback.and_then(|e| e.think),
+        chat_template_kwargs: fallback.and_then(|e| e.chat_template_kwargs.clone()),
+        ollama_num_ctx: fallback.and_then(|e| e.ollama_num_ctx),
+        ollama_num_predict: fallback.and_then(|e| e.ollama_num_predict),
+        ollama_temperature_override: fallback.and_then(|e| e.ollama_temperature_override),
     }
 }
 
@@ -814,11 +865,7 @@ pub fn scrub_secret_patterns(input: &str) -> String {
 
     for prefix in PREFIXES {
         let mut search_from = 0;
-        loop {
-            let Some(rel) = scrubbed[search_from..].find(prefix) else {
-                break;
-            };
-
+        while let Some(rel) = scrubbed[search_from..].find(prefix) {
             let start = search_from + rel;
             let content_start = start + prefix.len();
             let end = token_end(&scrubbed, content_start);
@@ -1083,6 +1130,35 @@ pub fn create_provider(name: &str, api_key: Option<&str>) -> anyhow::Result<Box<
     create_provider_with_options(name, api_key, &ProviderRuntimeOptions::default())
 }
 
+/// Build a `ModelProviderConfig` populated with the named provider's
+/// effective default values from its `Provider` trait methods (the same
+/// `default_temperature` / `default_max_tokens` / `default_timeout_secs` /
+/// `default_wire_api` / `default_base_url` the runtime already calls at
+/// every chat request).
+///
+/// One shared function — gateway onboarding pre-fill, CLI wizard prompt
+/// pre-fill, and any future caller all consume this so the surfaces can't
+/// drift. The schema-level cleanup (per-provider typed configs that would
+/// eliminate the hardcoded field list here) ships with v3 / #5947.
+///
+/// Returns `ModelProviderConfig::default()` (all `None`) for unknown
+/// providers — the form just opens blank, callers don't have to special
+/// case.
+pub fn default_provider_config(name: &str) -> zeroclaw_config::schema::ModelProviderConfig {
+    use zeroclaw_config::schema::ModelProviderConfig;
+    let Ok(handle) = create_provider(name, None) else {
+        return ModelProviderConfig::default();
+    };
+    ModelProviderConfig {
+        base_url: handle.default_base_url().map(str::to_string),
+        temperature: Some(handle.default_temperature()),
+        max_tokens: Some(handle.default_max_tokens()),
+        timeout_secs: Some(handle.default_timeout_secs()),
+        wire_api: Some(handle.default_wire_api().to_string()),
+        ..Default::default()
+    }
+}
+
 /// Factory: create provider with runtime options (auth profile override, state dir).
 pub fn create_provider_with_options(
     name: &str,
@@ -1197,7 +1273,7 @@ fn create_provider_with_url_and_options(
             Ok(Box::new(p))
         }
         "anthropic" => {
-            let mut p = anthropic::AnthropicProvider::new(key);
+            let mut p = anthropic::AnthropicProvider::with_base_url(key, api_url);
             if let Some(mt) = options.provider_max_tokens {
                 p = p.with_max_tokens(mt);
             }
@@ -1216,11 +1292,16 @@ fn create_provider_with_url_and_options(
 
             let api_url = env_url.as_deref().or(api_url);
 
-            Ok(Box::new(ollama::OllamaProvider::new_with_reasoning(
-                api_url,
-                key,
-                options.reasoning_enabled,
-            )))
+            let tuning = ollama::OllamaTuning::from_runtime_overrides(
+                options.ollama_num_ctx,
+                options.ollama_num_predict,
+                options.ollama_temperature_override,
+            );
+
+            Ok(Box::new(
+                ollama::OllamaProvider::new_with_reasoning(api_url, key, options.reasoning_enabled)
+                    .with_tuning(tuning),
+            ))
         }
         "gemini" | "google" | "google-gemini" => {
             let state_dir = options.zeroclaw_dir.clone().unwrap_or_else(|| {
@@ -1308,12 +1389,13 @@ fn create_provider_with_url_and_options(
             )))
         }
         name if minimax_base_url(name).is_some() => Ok(compat(
-            OpenAiCompatibleProvider::new_merge_system_into_user(
+            OpenAiCompatibleProvider::new(
                 "MiniMax",
                 minimax_base_url(name).expect("checked in guard"),
                 key,
                 AuthStyle::Bearer,
-            ),
+            )
+            .with_merge_system_into_user(),
         )),
         "azure_openai" | "azure-openai" | "azure" => {
             let resource = std::env::var("AZURE_OPENAI_RESOURCE")
@@ -1398,27 +1480,32 @@ fn create_provider_with_url_and_options(
         }
 
         // ── Extended ecosystem (community favorites) ─────────
-        "groq" => Ok(compat(
-            OpenAiCompatibleProvider::new(
+        "groq" => {
+            let mut p = OpenAiCompatibleProvider::new(
                 "Groq",
                 "https://api.groq.com/openai/v1",
                 key,
                 AuthStyle::Bearer,
-            )
-            .without_native_tools(),
-        )),
+            );
+            // Default to text-fallback because Groq's llama-family models
+            // reject native tool calls with HTTP 400 (#5848). Operators can
+            // override per-profile via `[providers.models.<alias>] native_tools = true`
+            // to enable native tool calling for Groq models that support it.
+            if options.native_tools != Some(true) {
+                p = p.without_native_tools();
+            }
+            Ok(compat(p))
+        }
         "mistral" => Ok(compat(OpenAiCompatibleProvider::new(
             "Mistral",
             "https://api.mistral.ai/v1",
             key,
             AuthStyle::Bearer,
         ))),
-        "xai" | "grok" => Ok(compat(OpenAiCompatibleProvider::new(
-            "xAI",
-            "https://api.x.ai",
-            key,
-            AuthStyle::Bearer,
-        ))),
+        "xai" | "grok" => Ok(compat(
+            OpenAiCompatibleProvider::new("xAI", "https://api.x.ai/v1", key, AuthStyle::Bearer)
+                .with_models_dev_key("xai"),
+        )),
         "deepseek" => Ok(compat(OpenAiCompatibleProvider::new(
             "DeepSeek",
             "https://api.deepseek.com",
@@ -1476,23 +1563,27 @@ fn create_provider_with_url_and_options(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .unwrap_or("http://localhost:8080/v1");
-            let llama_cpp_key = key
+            let credential = key
                 .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .unwrap_or("llama.cpp");
-            let provider = OpenAiCompatibleProvider::new_with_vision(
-                "llama.cpp",
-                base_url,
-                Some(llama_cpp_key),
-                AuthStyle::Bearer,
-                true,
-            );
-            let provider = if options.merge_system_into_user {
-                provider.with_merge_system_into_user()
-            } else {
-                provider
-            };
-            Ok(compat(provider))
+                .filter(|v| !v.is_empty())
+                .map(str::to_string);
+            let mut provider = llamacpp::LlamaCppProvider::new(base_url, credential.as_deref());
+            if let Some(t) = options.provider_timeout_secs {
+                provider = provider.with_timeout_secs(t);
+            }
+            if !options.extra_headers.is_empty() {
+                provider = provider.with_extra_headers(options.extra_headers.clone());
+            }
+            if let Some(mt) = options.provider_max_tokens {
+                provider = provider.with_max_tokens(Some(mt));
+            }
+            if options.think.is_some() {
+                provider = provider.with_think(options.think);
+            }
+            if options.chat_template_kwargs.is_some() {
+                provider = provider.with_chat_template_kwargs(options.chat_template_kwargs.clone());
+            }
+            Ok(Box::new(provider))
         }
         "sglang" => {
             let base_url = api_url
@@ -1666,7 +1757,13 @@ fn create_provider_with_url_and_options(
         // ── Chinese AI providers ─────────────────────────────
         "stepfun" | "step" => Ok(compat(OpenAiCompatibleProvider::new(
             "Stepfun",
-            "https://api.stepfun.com/v1",
+            STEPFUN_CN_BASE_URL,
+            key,
+            AuthStyle::Bearer,
+        ))),
+        "stepfun-intl" | "step-intl" => Ok(compat(OpenAiCompatibleProvider::new(
+            "Stepfun (International)",
+            STEPFUN_INTL_BASE_URL,
             key,
             AuthStyle::Bearer,
         ))),
@@ -1949,14 +2046,47 @@ pub fn create_routed_provider_with_options(
     )))
 }
 
+/// How a provider's "configured / active" state is computed against a
+/// user's `ProvidersConfig`. Each `ProviderInfo` row picks the variant
+/// that matches its activation rule, so consumers (the integrations
+/// registry, dashboards, doctor) dispatch generically without knowing
+/// any provider names. Adding a new provider means adding one
+/// `ProviderInfo` row — no edits at the consumer site.
+#[derive(Clone, Copy)]
+pub enum ProviderActivation {
+    /// Active when `providers.fallback` matches the provider's
+    /// canonical `name` or any entry in `aliases`. The default and
+    /// most common case.
+    FallbackKey,
+    /// Active when `providers.fallback` matches AND the resolved
+    /// fallback profile carries a non-empty `api_key`. Used for
+    /// providers (e.g. OpenRouter) where the route is meaningless
+    /// without an API key.
+    FallbackKeyWithApiKey,
+    /// Active when the resolved fallback profile's `model` field
+    /// starts with the carried prefix. Used for vendors keyed off the
+    /// model id rather than the provider id (e.g. `model = "google/..."`).
+    ModelPrefix(&'static str),
+    /// Active when the supplied predicate returns true for the
+    /// configured fallback key. Used for multi-region families with
+    /// rich alias / endpoint matching beyond a flat string list.
+    FallbackKeyMatches(fn(&str) -> bool),
+}
+
 /// Information about a supported provider for display purposes.
 pub struct ProviderInfo {
     /// Canonical name used in config (e.g. `"openrouter"`)
     pub name: &'static str,
     /// Human-readable display name
     pub display_name: &'static str,
+    /// One-line description shown in the integrations panel and
+    /// `zeroclaw integration info <name>`. Empty string suppresses the
+    /// description line.
+    pub description: &'static str,
     /// Alternative names accepted in config
     pub aliases: &'static [&'static str],
+    /// How activation is computed against a `ProvidersConfig`.
+    pub activation: ProviderActivation,
     /// Whether the provider runs locally (no API key required)
     pub local: bool,
 }
@@ -1971,115 +2101,152 @@ pub fn list_providers() -> Vec<ProviderInfo> {
         ProviderInfo {
             name: "openrouter",
             display_name: "OpenRouter",
+            description: "200+ models, 1 API key",
             aliases: &[],
+            activation: ProviderActivation::FallbackKeyWithApiKey,
             local: false,
         },
         ProviderInfo {
             name: "anthropic",
             display_name: "Anthropic",
+            description: "Claude 3.5/4 Sonnet & Opus",
             aliases: &[],
+            activation: ProviderActivation::FallbackKey,
             local: false,
         },
         ProviderInfo {
             name: "openai",
             display_name: "OpenAI",
+            description: "GPT-4o, GPT-5, o1",
             aliases: &[],
+            activation: ProviderActivation::FallbackKey,
             local: false,
         },
         ProviderInfo {
             name: "openai-codex",
             display_name: "OpenAI Codex (OAuth)",
+            description: "ChatGPT-Plus OAuth via Codex CLI",
             aliases: &["openai_codex", "codex"],
+            activation: ProviderActivation::FallbackKey,
             local: false,
         },
         ProviderInfo {
             name: "telnyx",
             display_name: "Telnyx",
+            description: "Telnyx Inference",
             aliases: &[],
+            activation: ProviderActivation::FallbackKey,
             local: false,
         },
         ProviderInfo {
             name: "azure_openai",
             display_name: "Azure OpenAI",
+            description: "Azure-hosted OpenAI models",
             aliases: &["azure-openai", "azure"],
+            activation: ProviderActivation::FallbackKey,
             local: false,
         },
         ProviderInfo {
             name: "ollama",
             display_name: "Ollama",
+            description: "Local models (Llama, Qwen, etc.)",
             aliases: &[],
+            activation: ProviderActivation::FallbackKey,
             local: true,
         },
         ProviderInfo {
             name: "gemini",
             display_name: "Google Gemini",
+            description: "Gemini 2.5 Pro/Flash",
             aliases: &["google", "google-gemini"],
+            activation: ProviderActivation::ModelPrefix("google/"),
             local: false,
         },
         // ── OpenAI-compatible providers ──────────────────────
         ProviderInfo {
             name: "venice",
             display_name: "Venice",
+            description: "Privacy-first inference",
             aliases: &[],
+            activation: ProviderActivation::FallbackKey,
             local: false,
         },
         ProviderInfo {
             name: "vercel",
             display_name: "Vercel AI Gateway",
+            description: "Vercel AI Gateway",
             aliases: &["vercel-ai"],
+            activation: ProviderActivation::FallbackKey,
             local: false,
         },
         ProviderInfo {
             name: "cloudflare",
             display_name: "Cloudflare AI",
+            description: "Cloudflare AI Gateway",
             aliases: &["cloudflare-ai"],
+            activation: ProviderActivation::FallbackKey,
             local: false,
         },
         ProviderInfo {
             name: "moonshot",
             display_name: "Moonshot",
+            description: "Kimi & Kimi Coding",
             aliases: &["kimi"],
+            activation: ProviderActivation::FallbackKeyMatches(is_moonshot_alias),
             local: false,
         },
         ProviderInfo {
             name: "kimi-code",
             display_name: "Kimi Code",
+            description: "Kimi for Coding",
             aliases: &["kimi_coding", "kimi_for_coding"],
+            activation: ProviderActivation::FallbackKey,
             local: false,
         },
         ProviderInfo {
             name: "synthetic",
             display_name: "Synthetic",
+            description: "Synthetic AI models",
             aliases: &[],
+            activation: ProviderActivation::FallbackKey,
             local: false,
         },
         ProviderInfo {
             name: "opencode",
             display_name: "OpenCode Zen",
+            description: "Code-focused AI models",
             aliases: &["opencode-zen"],
+            activation: ProviderActivation::FallbackKey,
             local: false,
         },
         ProviderInfo {
             name: "opencode-go",
             display_name: "OpenCode Go",
+            description: "Subsidized code-focused AI models",
             aliases: &[],
+            activation: ProviderActivation::FallbackKey,
             local: false,
         },
         ProviderInfo {
             name: "zai",
             display_name: "Z.AI",
+            description: "Z.AI inference",
             aliases: &["z.ai"],
+            activation: ProviderActivation::FallbackKeyMatches(is_zai_alias),
             local: false,
         },
         ProviderInfo {
             name: "glm",
             display_name: "GLM (Zhipu)",
+            description: "ChatGLM / Zhipu models",
             aliases: &["zhipu"],
+            activation: ProviderActivation::FallbackKeyMatches(is_glm_alias),
             local: false,
         },
         ProviderInfo {
             name: "minimax",
             display_name: "MiniMax",
+            description: "MiniMax AI models",
             aliases: &[
                 "minimax-intl",
                 "minimax-io",
@@ -2091,29 +2258,37 @@ pub fn list_providers() -> Vec<ProviderInfo> {
                 "minimax-portal",
                 "minimax-portal-cn",
             ],
+            activation: ProviderActivation::FallbackKeyMatches(is_minimax_alias),
             local: false,
         },
         ProviderInfo {
             name: "bedrock",
             display_name: "Amazon Bedrock",
+            description: "AWS managed model access",
             aliases: &["aws-bedrock"],
+            activation: ProviderActivation::FallbackKey,
             local: false,
         },
         ProviderInfo {
             name: "qianfan",
             display_name: "Qianfan (Baidu)",
+            description: "Baidu AI models",
             aliases: &["baidu"],
+            activation: ProviderActivation::FallbackKeyMatches(is_qianfan_alias),
             local: false,
         },
         ProviderInfo {
             name: "doubao",
             display_name: "Doubao (Volcengine)",
+            description: "Volcengine Doubao / Ark",
             aliases: &["volcengine", "ark", "doubao-cn"],
+            activation: ProviderActivation::FallbackKey,
             local: false,
         },
         ProviderInfo {
             name: "qwen",
             display_name: "Qwen (DashScope / Qwen Code OAuth)",
+            description: "Alibaba DashScope Qwen models",
             aliases: &[
                 "dashscope",
                 "qwen-intl",
@@ -2124,262 +2299,355 @@ pub fn list_providers() -> Vec<ProviderInfo> {
                 "qwen-oauth",
                 "qwen_oauth",
             ],
+            activation: ProviderActivation::FallbackKeyMatches(is_qwen_alias),
             local: false,
         },
         ProviderInfo {
             name: "bailian",
             display_name: "Bailian (Aliyun)",
+            description: "Alibaba Bailian (Aliyun)",
             aliases: &["aliyun-bailian", "aliyun"],
+            activation: ProviderActivation::FallbackKey,
             local: false,
         },
         ProviderInfo {
             name: "groq",
             display_name: "Groq",
+            description: "Ultra-fast LPU inference",
             aliases: &[],
+            activation: ProviderActivation::FallbackKey,
             local: false,
         },
         ProviderInfo {
             name: "mistral",
             display_name: "Mistral",
+            description: "Mistral Large & Codestral",
             aliases: &[],
+            activation: ProviderActivation::ModelPrefix("mistral"),
             local: false,
         },
         ProviderInfo {
             name: "xai",
             display_name: "xAI (Grok)",
+            description: "Grok 3 & 4",
             aliases: &["grok"],
+            activation: ProviderActivation::ModelPrefix("x-ai/"),
             local: false,
         },
         ProviderInfo {
             name: "deepseek",
             display_name: "DeepSeek",
+            description: "DeepSeek V3 & R1",
             aliases: &[],
+            activation: ProviderActivation::ModelPrefix("deepseek/"),
             local: false,
         },
         ProviderInfo {
             name: "together",
             display_name: "Together AI",
+            description: "Open-source model hosting",
             aliases: &["together-ai"],
+            activation: ProviderActivation::FallbackKey,
             local: false,
         },
         ProviderInfo {
             name: "fireworks",
             display_name: "Fireworks AI",
+            description: "Fast open-source inference",
             aliases: &["fireworks-ai"],
+            activation: ProviderActivation::FallbackKey,
             local: false,
         },
         ProviderInfo {
             name: "novita",
             display_name: "Novita AI",
+            description: "Affordable open-source inference",
             aliases: &[],
+            activation: ProviderActivation::FallbackKey,
             local: false,
         },
         ProviderInfo {
             name: "perplexity",
             display_name: "Perplexity",
+            description: "Search-augmented AI",
             aliases: &[],
+            activation: ProviderActivation::FallbackKey,
             local: false,
         },
         ProviderInfo {
             name: "cohere",
             display_name: "Cohere",
+            description: "Command R+ & embeddings",
             aliases: &[],
+            activation: ProviderActivation::FallbackKey,
             local: false,
         },
         ProviderInfo {
             name: "copilot",
             display_name: "GitHub Copilot",
+            description: "GitHub Copilot",
             aliases: &["github-copilot"],
+            activation: ProviderActivation::FallbackKey,
             local: false,
         },
         ProviderInfo {
             name: "claude-code",
             display_name: "Claude Code (CLI)",
+            description: "Claude Code CLI (local)",
             aliases: &[],
+            activation: ProviderActivation::FallbackKey,
             local: true,
         },
         ProviderInfo {
             name: "gemini-cli",
             display_name: "Gemini CLI",
+            description: "Gemini CLI (local)",
             aliases: &[],
+            activation: ProviderActivation::FallbackKey,
             local: true,
         },
         ProviderInfo {
             name: "kilocli",
             display_name: "KiloCLI",
+            description: "KiloCLI (local)",
             aliases: &["kilo"],
+            activation: ProviderActivation::FallbackKey,
             local: true,
         },
         ProviderInfo {
             name: "lmstudio",
             display_name: "LM Studio",
+            description: "Local model server",
             aliases: &["lm-studio"],
+            activation: ProviderActivation::FallbackKey,
             local: true,
         },
         ProviderInfo {
             name: "llamacpp",
             display_name: "llama.cpp server",
+            description: "llama.cpp server (local)",
             aliases: &["llama.cpp"],
+            activation: ProviderActivation::FallbackKey,
             local: true,
         },
         ProviderInfo {
             name: "sglang",
             display_name: "SGLang",
+            description: "SGLang inference server (local)",
             aliases: &[],
+            activation: ProviderActivation::FallbackKey,
             local: true,
         },
         ProviderInfo {
             name: "vllm",
             display_name: "vLLM",
+            description: "vLLM inference server (local)",
             aliases: &[],
+            activation: ProviderActivation::FallbackKey,
             local: true,
         },
         ProviderInfo {
             name: "osaurus",
             display_name: "Osaurus",
+            description: "Osaurus inference (local)",
             aliases: &[],
+            activation: ProviderActivation::FallbackKey,
             local: true,
         },
         ProviderInfo {
             name: "nvidia",
             display_name: "NVIDIA NIM",
+            description: "NVIDIA NIM",
             aliases: &["nvidia-nim", "build.nvidia.com"],
+            activation: ProviderActivation::FallbackKey,
             local: false,
         },
         ProviderInfo {
             name: "siliconflow",
             display_name: "SiliconFlow",
+            description: "SiliconFlow inference",
             aliases: &["silicon-flow"],
+            activation: ProviderActivation::FallbackKey,
             local: false,
         },
         ProviderInfo {
             name: "aihubmix",
             display_name: "AiHubMix",
+            description: "AIHubMix gateway",
             aliases: &[],
+            activation: ProviderActivation::FallbackKey,
             local: false,
         },
         ProviderInfo {
             name: "litellm",
             display_name: "LiteLLM",
+            description: "LiteLLM proxy",
             aliases: &["lite-llm"],
+            activation: ProviderActivation::FallbackKey,
             local: false,
         },
         // ── Fast inference ────────────────────────────────────
         ProviderInfo {
             name: "cerebras",
             display_name: "Cerebras",
+            description: "Cerebras inference",
             aliases: &[],
+            activation: ProviderActivation::FallbackKey,
             local: false,
         },
         ProviderInfo {
             name: "sambanova",
             display_name: "SambaNova",
+            description: "SambaNova inference",
             aliases: &[],
+            activation: ProviderActivation::FallbackKey,
             local: false,
         },
         ProviderInfo {
             name: "hyperbolic",
             display_name: "Hyperbolic",
+            description: "Hyperbolic Labs inference",
             aliases: &[],
+            activation: ProviderActivation::FallbackKey,
             local: false,
         },
         // ── Model hosting platforms ──────────────────────────
         ProviderInfo {
             name: "deepinfra",
             display_name: "DeepInfra",
+            description: "DeepInfra inference",
             aliases: &["deep-infra"],
+            activation: ProviderActivation::FallbackKey,
             local: false,
         },
         ProviderInfo {
             name: "huggingface",
             display_name: "Hugging Face",
+            description: "Open-source models via Inference API",
             aliases: &["hf"],
+            activation: ProviderActivation::FallbackKey,
             local: false,
         },
         ProviderInfo {
             name: "ai21",
             display_name: "AI21 Labs",
+            description: "AI21 Labs (Jamba)",
             aliases: &["ai21-labs"],
+            activation: ProviderActivation::FallbackKey,
             local: false,
         },
         ProviderInfo {
             name: "reka",
             display_name: "Reka",
+            description: "Reka multimodal models",
             aliases: &[],
+            activation: ProviderActivation::FallbackKey,
             local: false,
         },
         ProviderInfo {
             name: "baseten",
             display_name: "Baseten",
+            description: "Baseten model deployments",
             aliases: &[],
+            activation: ProviderActivation::FallbackKey,
             local: false,
         },
         ProviderInfo {
             name: "nscale",
             display_name: "Nscale",
+            description: "Nscale serverless inference",
             aliases: &[],
+            activation: ProviderActivation::FallbackKey,
             local: false,
         },
         ProviderInfo {
             name: "anyscale",
             display_name: "Anyscale",
+            description: "Anyscale Endpoints",
             aliases: &[],
+            activation: ProviderActivation::FallbackKey,
             local: false,
         },
         ProviderInfo {
             name: "nebius",
             display_name: "Nebius AI Studio",
+            description: "Nebius AI Studio",
             aliases: &[],
+            activation: ProviderActivation::FallbackKey,
             local: false,
         },
         ProviderInfo {
             name: "friendli",
             display_name: "Friendli AI",
+            description: "Friendli Suite",
             aliases: &["friendliai"],
+            activation: ProviderActivation::FallbackKey,
             local: false,
         },
         ProviderInfo {
             name: "lepton",
             display_name: "Lepton AI",
+            description: "Lepton AI",
             aliases: &["lepton-ai"],
+            activation: ProviderActivation::FallbackKey,
             local: false,
         },
         // ── Chinese AI providers ─────────────────────────────
         ProviderInfo {
             name: "stepfun",
             display_name: "Stepfun",
+            description: "Stepfun (CN)",
             aliases: &["step"],
+            activation: ProviderActivation::FallbackKey,
+            local: false,
+        },
+        ProviderInfo {
+            name: "stepfun-intl",
+            display_name: "Stepfun (International)",
+            description: "Stepfun (International)",
+            aliases: &["step-intl"],
+            activation: ProviderActivation::FallbackKey,
             local: false,
         },
         ProviderInfo {
             name: "baichuan",
             display_name: "Baichuan",
+            description: "Baichuan AI",
             aliases: &[],
+            activation: ProviderActivation::FallbackKey,
             local: false,
         },
         ProviderInfo {
             name: "yi",
             display_name: "01.AI (Yi)",
+            description: "01.AI (Yi)",
             aliases: &["01ai", "lingyiwanwu"],
+            activation: ProviderActivation::FallbackKey,
             local: false,
         },
         ProviderInfo {
             name: "hunyuan",
             display_name: "Tencent Hunyuan",
+            description: "Tencent Hunyuan",
             aliases: &["tencent"],
+            activation: ProviderActivation::FallbackKey,
             local: false,
         },
         // ── Cloud AI endpoints ───────────────────────────────
         ProviderInfo {
             name: "ovhcloud",
             display_name: "OVHcloud AI Endpoints",
+            description: "OVHcloud AI Endpoints",
             aliases: &["ovh"],
+            activation: ProviderActivation::FallbackKey,
             local: false,
         },
         ProviderInfo {
             name: "avian",
             display_name: "Avian",
+            description: "Avian inference",
             aliases: &[],
+            activation: ProviderActivation::FallbackKey,
             local: false,
         },
     ]
@@ -2843,13 +3111,13 @@ mod tests {
     }
 
     #[test]
-    fn factory_minimax_disables_native_tool_calling() {
+    fn factory_minimax_supports_native_tool_calling() {
         let minimax = create_provider("minimax", Some("key")).expect("provider should resolve");
-        assert!(!minimax.supports_native_tools());
+        assert!(minimax.supports_native_tools());
 
         let minimax_cn =
             create_provider("minimax-cn", Some("key")).expect("provider should resolve");
-        assert!(!minimax_cn.supports_native_tools());
+        assert!(minimax_cn.supports_native_tools());
     }
 
     #[test]
@@ -3016,6 +3284,75 @@ mod tests {
     #[test]
     fn factory_groq() {
         assert!(create_provider("groq", Some("key")).is_ok());
+    }
+
+    #[test]
+    fn factory_groq_disables_native_tools_by_default() {
+        // Default behavior preserves the #5848 blanket disable: llama-family
+        // Groq models reject native tool calls with HTTP 400.
+        let provider =
+            create_provider_with_options("groq", Some("key"), &ProviderRuntimeOptions::default())
+                .expect("groq factory must succeed");
+        assert!(
+            !provider.supports_native_tools(),
+            "Groq must default to text-fallback for llama-family compatibility (#5848)"
+        );
+    }
+
+    #[test]
+    fn factory_groq_honors_native_tools_override_true() {
+        // Operator opt-in via `[providers.models.<alias>] native_tools = true`
+        // skips the default disable so non-llama Groq models can use native
+        // tool calling (#5932).
+        let options = ProviderRuntimeOptions {
+            native_tools: Some(true),
+            ..Default::default()
+        };
+        let provider = create_provider_with_options("groq", Some("key"), &options)
+            .expect("groq factory must succeed");
+        assert!(
+            provider.supports_native_tools(),
+            "Groq with `native_tools = true` must enable native tool calling (#5932)"
+        );
+    }
+
+    #[test]
+    fn factory_groq_native_tools_override_false_keeps_disable() {
+        // Explicit `native_tools = false` matches the default behavior; this
+        // documents that the option is tri-state and `Some(false)` is not a
+        // no-op surprise.
+        let options = ProviderRuntimeOptions {
+            native_tools: Some(false),
+            ..Default::default()
+        };
+        let provider = create_provider_with_options("groq", Some("key"), &options)
+            .expect("groq factory must succeed");
+        assert!(
+            !provider.supports_native_tools(),
+            "Groq with explicit `native_tools = false` must remain text-fallback"
+        );
+    }
+
+    #[test]
+    fn provider_runtime_options_from_config_propagates_native_tools() {
+        // The end-to-end path the operator uses: setting `native_tools` on
+        // the active provider profile must reach `ProviderRuntimeOptions`
+        // so the Groq factory branch sees it (#5932).
+        let mut config = zeroclaw_config::schema::Config::default();
+        let mut groq = zeroclaw_config::schema::ModelProviderConfig {
+            native_tools: Some(true),
+            ..Default::default()
+        };
+        groq.base_url = Some("https://api.groq.com/openai/v1".to_string());
+        config.providers.models.insert("groq".to_string(), groq);
+        config.providers.fallback = Some("groq".to_string());
+
+        let options = provider_runtime_options_from_config(&config);
+        assert_eq!(
+            options.native_tools,
+            Some(true),
+            "native_tools must propagate from the active provider profile to runtime options"
+        );
     }
 
     #[test]
@@ -3801,5 +4138,52 @@ mod tests {
 
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::remove_var("ZEROCLAW_PROVIDER_URL") };
+    }
+
+    #[test]
+    fn ollama_runtime_overrides_populate_tuning_struct() {
+        // Mirror the factory's tuning derivation: the same expression used
+        // inside `create_provider_with_url_and_options`'s "ollama" arm.
+        // Asserting on the resulting struct gives us downcast-free coverage
+        // that the three runtime-option fields actually reach the provider.
+        let options = ProviderRuntimeOptions {
+            ollama_num_ctx: Some(16384),
+            ollama_num_predict: Some(4096),
+            ollama_temperature_override: Some(0.5),
+            ..ProviderRuntimeOptions::default()
+        };
+
+        let tuning = ollama::OllamaTuning::from_runtime_overrides(
+            options.ollama_num_ctx,
+            options.ollama_num_predict,
+            options.ollama_temperature_override,
+        );
+        assert_eq!(tuning.num_ctx, 16384);
+        assert_eq!(tuning.num_predict, 4096);
+        assert_eq!(tuning.temperature_override, Some(0.5));
+
+        let provider = ollama::OllamaProvider::new(None, None).with_tuning(tuning);
+        assert_eq!(provider.tuning(), tuning);
+
+        // The factory itself must succeed with the same options.
+        let factory_provider = create_provider_with_url_and_options("ollama", None, None, &options);
+        assert!(factory_provider.is_ok());
+    }
+
+    #[test]
+    fn ollama_runtime_overrides_default_to_none_temperature_override() {
+        // Default options must produce a tuning that leaves
+        // `temperature_override = None` so per-call temperature wins —
+        // the backward-compat guarantee for operators who never set the
+        // override in config.toml.
+        let options = ProviderRuntimeOptions::default();
+        let tuning = ollama::OllamaTuning::from_runtime_overrides(
+            options.ollama_num_ctx,
+            options.ollama_num_predict,
+            options.ollama_temperature_override,
+        );
+        assert!(tuning.temperature_override.is_none());
+        assert_eq!(tuning.num_ctx, ollama::OLLAMA_DEFAULT_NUM_CTX);
+        assert_eq!(tuning.num_predict, ollama::OLLAMA_DEFAULT_NUM_PREDICT);
     }
 }

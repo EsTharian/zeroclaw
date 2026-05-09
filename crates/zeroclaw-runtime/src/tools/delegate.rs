@@ -16,6 +16,11 @@ use zeroclaw_config::schema::{DelegateAgentConfig, DelegateToolConfig};
 use zeroclaw_memory::{Memory, NamespacedMemory};
 use zeroclaw_providers::{self, ChatMessage, Provider};
 
+/// Fallback temperature for sub-agent tool loops when the delegate config
+/// leaves it unset; matches the longstanding agentic default that balances
+/// coherence with enough variety to explore tool options.
+const DELEGATE_AGENTIC_DEFAULT_TEMPERATURE: f64 = 0.7;
+
 /// Serializable result of a background delegate task.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BackgroundDelegateResult {
@@ -467,8 +472,6 @@ impl DelegateTool {
             format!("[Context]\n{context}\n\n[Task]\n{prompt}")
         };
 
-        let temperature = agent_config.temperature.unwrap_or(0.7);
-
         // Agentic mode: run full tool-call loop with allowlisted tools.
         if agent_config.agentic {
             return self
@@ -477,7 +480,9 @@ impl DelegateTool {
                     agent_config,
                     &*provider,
                     &full_prompt,
-                    temperature,
+                    agent_config
+                        .temperature
+                        .unwrap_or(DELEGATE_AGENTIC_DEFAULT_TEMPERATURE),
                 )
                 .await;
         }
@@ -497,7 +502,7 @@ impl DelegateTool {
                 system_prompt_ref,
                 &full_prompt,
                 &agent_config.model,
-                temperature,
+                agent_config.temperature,
             ),
         )
         .await;
@@ -783,6 +788,18 @@ impl DelegateTool {
             }
         }
 
+        // Capture the current receipt scope so each spawned sub-agent task
+        // re-enters it. `tokio::spawn` does not propagate task-locals, so
+        // without this `execute_sync`'s `try_with` would resolve to `None`
+        // inside the spawn and the parallel agents would run unsigned even
+        // when the parent turn has receipts enabled. The collector is `Arc`'d
+        // inside `ReceiptScope`, so all parallel agents push into the same
+        // per-turn collector the orchestrator renders after the loop returns.
+        let parent_receipt_scope = crate::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
+            .try_with(Clone::clone)
+            .ok()
+            .flatten();
+
         // Spawn all agents concurrently
         let mut handles = Vec::with_capacity(agent_names.len());
         for agent_name in &agent_names {
@@ -799,6 +816,7 @@ impl DelegateTool {
             let agent_name = agent_name.clone();
             let prompt = prompt.to_string();
             let args_clone = args.clone();
+            let receipt_scope = parent_receipt_scope.clone();
 
             handles.push(tokio::spawn(async move {
                 let inner = DelegateTool {
@@ -814,8 +832,13 @@ impl DelegateTool {
                     cancellation_token,
                     memory: None,
                 };
-                let result = Box::pin(inner.execute_sync(&agent_name, &prompt, &args_clone)).await;
-                (agent_name, result)
+                let agent_name_for_return = agent_name.clone();
+                let result = crate::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
+                    .scope(receipt_scope, async move {
+                        Box::pin(inner.execute_sync(&agent_name, &prompt, &args_clone)).await
+                    })
+                    .await;
+                (agent_name_for_return, result)
             }));
         }
 
@@ -1054,7 +1077,7 @@ impl DelegateTool {
             skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "",
-            tool_descriptions: None,
+
             security_summary: None,
             autonomy_level: crate::security::AutonomyLevel::default(),
         };
@@ -1148,6 +1171,17 @@ impl DelegateTool {
         let agentic_timeout_secs = agent_config
             .agentic_timeout_secs
             .unwrap_or(self.delegate_config.agentic_timeout_secs);
+        // Forward the per-turn receipt scope from the parent loop so subagent
+        // tool calls land in the same collector as the top-level turn. When
+        // receipts are disabled (or no scope is set, e.g. CLI / background
+        // delegate spawn) this resolves to `None` and the sub-loop runs
+        // unsigned, matching the parent.
+        let receipt_scope = crate::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
+            .try_with(Clone::clone)
+            .ok()
+            .flatten();
+        let receipt_generator = receipt_scope.as_ref().map(|s| &s.generator);
+        let collected_receipts = receipt_scope.as_ref().map(|s| s.collector.as_ref());
         let result = tokio::time::timeout(
             Duration::from_secs(agentic_timeout_secs),
             run_tool_call_loop(
@@ -1164,7 +1198,7 @@ impl DelegateTool {
                 None,
                 &self.multimodal_config,
                 agent_config.max_iterations,
-                None,
+                Some(self.cancellation_token.child_token()),
                 None,
                 None,
                 &[],
@@ -1176,8 +1210,8 @@ impl DelegateTool {
                 0,    // context_token_budget: 0 = disabled for subagents
                 None, // shared_budget: TODO thread from parent in future
                 None, // channel: delegate subagents don't support approval
-                None, // receipt_generator
-                None, // collected_receipts
+                receipt_generator,
+                collected_receipts,
             ),
         )
         .await;
@@ -1362,7 +1396,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             Ok("unused".to_string())
         }
@@ -1371,7 +1405,7 @@ mod tests {
             &self,
             request: ChatRequest<'_>,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
             let has_tool_message = request.messages.iter().any(|m| m.role == "tool");
             if has_tool_message {
@@ -1388,6 +1422,7 @@ mod tests {
                         id: "call_1".to_string(),
                         name: "echo_tool".to_string(),
                         arguments: "{\"value\":\"ping\"}".to_string(),
+                        extra_content: None,
                     }],
                     usage: None,
                     reasoning_content: None,
@@ -1405,7 +1440,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             Ok("unused".to_string())
         }
@@ -1414,7 +1449,7 @@ mod tests {
             &self,
             _request: ChatRequest<'_>,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
             Ok(ChatResponse {
                 text: None,
@@ -1422,6 +1457,7 @@ mod tests {
                     id: "loop".to_string(),
                     name: "echo_tool".to_string(),
                     arguments: "{\"value\":\"x\"}".to_string(),
+                    extra_content: None,
                 }],
                 usage: None,
                 reasoning_content: None,
@@ -1438,7 +1474,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             Ok("unused".to_string())
         }
@@ -1447,7 +1483,7 @@ mod tests {
             &self,
             _request: ChatRequest<'_>,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
             Err(anyhow!("provider boom"))
         }
@@ -1895,6 +1931,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_agentic_forwards_receipt_scope_into_subagent_loop() {
+        // Receipt forwarding through the delegate sub-loop is the activation
+        // pass for #6182's delegate.rs:1184 acceptance criterion. With
+        // `TOOL_LOOP_RECEIPT_CONTEXT` scoped, every sub-tool call inside the
+        // delegate must produce a receipt that lands in the same per-turn
+        // collector the parent passed in. Without the task-local read in
+        // `execute_sync` this test fails: the collector stays empty because
+        // the sub-loop runs unsigned with `None, None` for the receipt args.
+        use crate::agent::tool_receipts::{
+            ReceiptGenerator, ReceiptScope, TOOL_LOOP_RECEIPT_CONTEXT,
+        };
+
+        let config = agentic_config(vec!["echo_tool".to_string()], 10);
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
+
+        let collector: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let scope = ReceiptScope {
+            generator: ReceiptGenerator::new(),
+            collector: Arc::clone(&collector),
+        };
+
+        let provider = OneToolThenFinalProvider;
+        let result = TOOL_LOOP_RECEIPT_CONTEXT
+            .scope(Some(scope), async {
+                tool.execute_agentic("agentic", &config, &provider, "run", 0.2)
+                    .await
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "delegate sub-loop must complete: {result:?}"
+        );
+        let receipts = collector.lock().unwrap();
+        assert_eq!(
+            receipts.len(),
+            1,
+            "expected exactly one receipt for the single echo_tool sub-call, got: {:?}",
+            receipts.as_slice()
+        );
+        assert!(
+            receipts[0].starts_with("echo_tool: zc-receipt-"),
+            "sub-tool receipt must be tagged with the tool name and a zc-receipt- HMAC token, got: {}",
+            receipts[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_agentic_emits_no_receipts_when_scope_absent() {
+        // Backward-compat for callers without a scoped receipt context (CLI,
+        // background spawn that does not forward scope, tests). The sub-loop
+        // must run unsigned and the agent output must not carry a
+        // `[receipt: ` trailer.
+        let config = agentic_config(vec!["echo_tool".to_string()], 10);
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
+
+        let provider = OneToolThenFinalProvider;
+        let result = tool
+            .execute_agentic("agentic", &config, &provider, "run", 0.2)
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(
+            !result.output.contains("[receipt: "),
+            "no receipt trailer must appear in agent output when receipts are disabled, got: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
     async fn execute_agentic_propagates_provider_errors() {
         let config = agentic_config(vec!["echo_tool".to_string()], 10);
         let tool = DelegateTool::new(HashMap::new(), None, test_security())
@@ -1953,7 +2064,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             Ok("unused".to_string())
         }
@@ -1962,7 +2073,7 @@ mod tests {
             &self,
             request: ChatRequest<'_>,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
             let has_tool_message = request.messages.iter().any(|m| m.role == "tool");
             if has_tool_message {
@@ -1979,6 +2090,7 @@ mod tests {
                         id: "call_mcp".to_string(),
                         name: "mcp_fake".to_string(),
                         arguments: "{}".to_string(),
+                        extra_content: None,
                     }],
                     usage: None,
                     reasoning_content: None,

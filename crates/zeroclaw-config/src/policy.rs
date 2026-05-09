@@ -76,7 +76,7 @@ impl Clone for ActionTracker {
 ///
 /// Each unique sender key (Telegram thread ID, Discord channel, etc.) gets
 /// its own independent [`ActionTracker`] bucket. When no sender is in scope
-/// (cron jobs, CLI), the [`GLOBAL_KEY`] bucket is used.
+/// (cron jobs, CLI), the `GLOBAL_KEY` bucket is used.
 ///
 /// Note: sender buckets accumulate for the daemon lifetime with no eviction.
 /// This is acceptable for bounded sets of chat IDs; in high-cardinality deployments,
@@ -181,7 +181,7 @@ pub struct SecurityPolicy {
 
 /// Default allowed commands for Unix platforms.
 #[cfg(not(target_os = "windows"))]
-fn default_allowed_commands() -> Vec<String> {
+pub(crate) fn default_allowed_commands() -> Vec<String> {
     #[allow(unused_mut)]
     let mut cmds = vec![
         "git".into(),
@@ -218,7 +218,7 @@ fn default_allowed_commands() -> Vec<String> {
 /// Includes both native Windows commands and their Unix equivalents
 /// (available via Git for Windows, WSL, etc.).
 #[cfg(target_os = "windows")]
-fn default_allowed_commands() -> Vec<String> {
+pub(crate) fn default_allowed_commands() -> Vec<String> {
     vec![
         // Cross-platform tools
         "git".into(),
@@ -255,7 +255,7 @@ fn default_allowed_commands() -> Vec<String> {
 
 /// Default forbidden paths for Unix platforms.
 #[cfg(not(target_os = "windows"))]
-fn default_forbidden_paths() -> Vec<String> {
+pub(crate) fn default_forbidden_paths() -> Vec<String> {
     vec![
         "/etc".into(),
         "/root".into(),
@@ -280,7 +280,7 @@ fn default_forbidden_paths() -> Vec<String> {
 
 /// Default forbidden paths for Windows platforms.
 #[cfg(target_os = "windows")]
-fn default_forbidden_paths() -> Vec<String> {
+pub(crate) fn default_forbidden_paths() -> Vec<String> {
     vec![
         "C:\\Windows".into(),
         "C:\\Windows\\System32".into(),
@@ -341,6 +341,24 @@ fn expand_user_path(path: &str) -> PathBuf {
     }
 
     PathBuf::from(path)
+}
+
+/// Returns `true` if `path` is exactly the OS null device.
+///
+/// `/dev/null` is unconditionally permitted because redirecting output
+/// there is a common, harmless shell pattern. The rest of `/dev` remains
+/// blocked by the default forbidden-path list.
+fn is_null_device(path: &Path) -> bool {
+    #[cfg(not(target_os = "windows"))]
+    {
+        path == Path::new("/dev/null")
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let s = path.to_string_lossy();
+        let lower = s.to_ascii_lowercase();
+        lower == "nul" || lower == r"\\.\nul"
+    }
 }
 
 fn rootless_path(path: &Path) -> Option<PathBuf> {
@@ -548,10 +566,10 @@ fn contains_unquoted_single_ampersand(command: &str) -> bool {
                 match ch {
                     '\'' => quote = QuoteState::Single,
                     '"' => quote = QuoteState::Double,
-                    '&' => {
-                        if chars.next_if_eq(&'&').is_none() {
-                            return true;
-                        }
+                    // This must consume the second '&' so `&&` is not later
+                    // re-read as a lone trailing '&'.
+                    '&' if chars.next_if_eq(&'&').is_none() => {
+                        return true;
                     }
                     _ => {}
                 }
@@ -1163,11 +1181,12 @@ impl SecurityPolicy {
             }
 
             // Validate arguments for the command.
-            // Preserve original case for flag matching (e.g. git -C vs -c),
-            // while keeping a lowercased copy for case-insensitive checks elsewhere.
-            let args_orig: Vec<String> = words.map(|w| w.to_string()).collect();
-            let args: Vec<String> = args_orig.iter().map(|w| w.to_ascii_lowercase()).collect();
-            if !self.is_args_safe(base_cmd, &args_orig) {
+            // Both case-preserved and lowercased argument lists are provided:
+            //   - `args_cased` for case-sensitive comparisons (e.g. git -C vs -c)
+            //   - `args` (lowercased) for case-insensitive matches (e.g. subcommand names)
+            let args_cased: Vec<String> = words.map(|w| w.to_string()).collect();
+            let args: Vec<String> = args_cased.iter().map(|w| w.to_ascii_lowercase()).collect();
+            if !self.is_args_safe(base_cmd, &args, &args_cased) {
                 return false;
             }
             let _ = args; // lowercased args available for future use
@@ -1190,7 +1209,7 @@ impl SecurityPolicy {
     /// - ZeptoClaw GHSA-5wp8-q9mx-8jx8 (CVSS 9.8): same vulnerability class
     /// - OpenClaw strictInlineEval: blocks python -c, node -e, etc.
     /// - OWASP OS Command Injection Defense Cheat Sheet
-    fn is_args_safe(&self, base: &str, args: &[String]) -> bool {
+    fn is_args_safe(&self, base: &str, args: &[String], args_cased: &[String]) -> bool {
         let base = base.to_ascii_lowercase();
         match base.as_str() {
             "find" => {
@@ -1199,14 +1218,18 @@ impl SecurityPolicy {
             }
             "git" => {
                 // git config, alias, and -c can be used to set dangerous options
-                // (e.g. git config core.editor "rm -rf /")
-                !args.iter().any(|arg| {
-                    arg == "config"
-                        || arg.starts_with("config.")
-                        || arg == "alias"
-                        || arg.starts_with("alias.")
-                        || arg == "-c"
-                })
+                // (e.g. git config core.editor "rm -rf /").
+                // NOTE: `-c` (lowercase) is compared case-sensitively against
+                // `args_cased` because git's `-C` (uppercase, change directory)
+                // is a distinct, benign option that must not be conflated with
+                // `-c` (set config override). See #5809.
+                !args_cased.iter().any(|arg| arg == "-c")
+                    && !args.iter().any(|arg| {
+                        arg == "config"
+                            || arg.starts_with("config.")
+                            || arg == "alias"
+                            || arg.starts_with("alias.")
+                    })
             }
             "python" | "python3" => {
                 // -c executes arbitrary code from argument string
@@ -1358,6 +1381,12 @@ impl SecurityPolicy {
         // Expand "~" for consistent matching with forbidden paths and allowlists.
         let expanded_path = expand_user_path(path);
 
+        // The null device is always permitted regardless of workspace or
+        // forbidden-path config; the rest of /dev remains blocked as usual.
+        if is_null_device(&expanded_path) {
+            return true;
+        }
+
         // When workspace_only is set and the path is absolute, only allow it
         // if it falls within the workspace directory or an explicit allowed
         // root.  The workspace/allowed-root check runs BEFORE the forbidden
@@ -1396,6 +1425,10 @@ impl SecurityPolicy {
     /// Validate that a resolved path is inside the workspace or an allowed root.
     /// Call this AFTER joining `workspace_dir` + relative path and canonicalizing.
     pub fn is_resolved_path_allowed(&self, resolved: &Path) -> bool {
+        if is_null_device(resolved) {
+            return true;
+        }
+
         // Prefer canonical workspace root so `/a/../b` style config paths don't
         // cause false positives or negatives.
         let workspace_root = self
@@ -2635,6 +2668,26 @@ mod tests {
         assert!(p.is_command_allowed("echo \"A&B\""));
         assert!(p.is_command_allowed("echo \"A>B\""));
         assert!(p.is_command_allowed("echo \"A<B\""));
+    }
+
+    #[test]
+    fn git_dash_c_uppercase_is_allowed() {
+        // Regression test for #5809: git -C (change directory) must not be
+        // conflated with git -c (set config override) after arg lowercasing.
+        let p = default_policy();
+        assert!(
+            p.is_command_allowed("git -C /home/user/repo status --short"),
+            "git -C is benign and should be allowed"
+        );
+        assert!(
+            p.is_command_allowed("git -C /home/user/repo log --oneline -1"),
+            "git -C with log should be allowed"
+        );
+        // git -c (lowercase) is still blocked — config override injection
+        assert!(
+            !p.is_command_allowed("git -c core.editor=\"rm -rf /\" commit"),
+            "git -c must remain blocked"
+        );
     }
 
     #[test]
