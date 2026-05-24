@@ -7470,6 +7470,28 @@ pub async fn start_channels(
                         slot.insert(format!("{model_id}.cached_input"), cached);
                     }
                 }
+                // The agent loop passes the composite `<type>.<alias>` (e.g.
+                // `"gemini.smart"`) as `provider_name` to
+                // `record_tool_loop_cost_usage`, but the legacy and rate-sheet
+                // loops above key `by_type` only by bare provider type. Without
+                // fanning out, every priced model misses lookup and records as
+                // zero. Mirror each bare-type slot under every configured
+                // `<type>.<alias>` so both lookup shapes resolve identically.
+                let alias_fanout: Vec<(String, std::collections::HashMap<String, f64>)> =
+                    config
+                        .providers
+                        .models
+                        .iter_entries()
+                        .filter_map(|(type_k, alias_k, _)| {
+                            by_type
+                                .get(type_k)
+                                .cloned()
+                                .map(|map| (format!("{type_k}.{alias_k}"), map))
+                        })
+                        .collect();
+                for (composite_key, map) in alias_fanout {
+                    by_type.entry(composite_key).or_insert(map);
+                }
                 ChannelCostTrackingState {
                     tracker,
                     model_provider_pricing: Arc::new(by_type),
