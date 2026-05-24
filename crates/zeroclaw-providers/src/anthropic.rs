@@ -21,6 +21,14 @@ pub struct AnthropicModelProvider {
     credential: Option<String>,
     base_url: String,
     max_tokens: u32,
+    /// Extra JSON keys merged at the top level of every outbound request
+    /// body (mirrors `OpenRouterModelProvider::extra_body`). Fed from
+    /// `[providers.models.anthropic.<alias>].provider_extra` via the
+    /// factory. Used to e.g. inject `thinking: { type: "disabled" }`
+    /// when targeting DeepSeek's Anthropic-compat endpoint, which
+    /// otherwise returns thinking blocks that ZeroClaw can't yet
+    /// round-trip across multi-turn conversations.
+    extra_body: Option<serde_json::Value>,
 }
 
 #[cfg(test)]
@@ -213,6 +221,7 @@ impl AnthropicModelProvider {
                 .map(ToString::to_string),
             base_url,
             max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
+            extra_body: None,
         }
     }
 
@@ -220,6 +229,44 @@ impl AnthropicModelProvider {
     pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
         self.max_tokens = max_tokens;
         self
+    }
+
+    /// Merge `extra` into every outbound request body at the top level.
+    /// Keys in `extra` override conflicts. Mirrors the OpenRouter pattern.
+    pub fn with_extra_body(mut self, extra: serde_json::Value) -> Self {
+        self.extra_body = Some(extra);
+        self
+    }
+
+    /// Serialize `request` to JSON, merge `self.extra_body` keys at the top
+    /// level (extra_body wins on conflicts), and return the merged Value.
+    /// Mirrors `OpenRouterModelProvider::merge_extra_body`.
+    fn merge_extra_body<T: serde::Serialize>(
+        &self,
+        request: &T,
+    ) -> anyhow::Result<serde_json::Value> {
+        let mut value = serde_json::to_value(request)?;
+        let Some(extra) = &self.extra_body else {
+            return Ok(value);
+        };
+        let overrides = extra.as_object().ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"provider_extra": extra})),
+                "anthropic: provider_extra must be a JSON object"
+            );
+            anyhow::Error::msg(format!(
+                "provider_extra must be a JSON object, got: {extra}"
+            ))
+        })?;
+        if let Some(base) = value.as_object_mut() {
+            for (k, v) in overrides {
+                base.insert(k.clone(), v.clone());
+            }
+        }
+        Ok(value)
     }
 
     fn is_setup_token(token: &str) -> bool {
@@ -889,12 +936,13 @@ impl ModelProvider for AnthropicModelProvider {
             stream: None,
         };
 
+        let body = self.merge_extra_body(&request)?;
         let mut request = self
             .http_client()
             .post(format!("{}/v1/messages", self.base_url))
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
-            .json(&request);
+            .json(&body);
 
         request = self.apply_auth(request, credential);
 
@@ -983,12 +1031,13 @@ impl ModelProvider for AnthropicModelProvider {
             stream: None,
         };
 
+        let body = self.merge_extra_body(&native_request)?;
         let req = self
             .http_client()
             .post(format!("{}/v1/messages", self.base_url))
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
-            .json(&native_request);
+            .json(&body);
 
         let response = self.apply_auth(req, credential).send().await?;
         if !response.status().is_success() {
@@ -1162,7 +1211,15 @@ impl ModelProvider for AnthropicModelProvider {
             stream: Some(true),
         };
 
-        let body = Self::build_streaming_request(&native_request);
+        let mut body = Self::build_streaming_request(&native_request);
+        if let (Some(base), Some(extra)) = (
+            body.as_object_mut(),
+            self.extra_body.as_ref().and_then(|e| e.as_object()),
+        ) {
+            for (k, v) in extra {
+                base.insert(k.clone(), v.clone());
+            }
+        }
         let client = self.http_client();
         let url = format!("{}/v1/messages", self.base_url);
         let is_oauth = Self::is_setup_token(&credential);
@@ -2125,6 +2182,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             credential: Some("test-key".to_string()),
             base_url: format!("http://{addr}"),
             max_tokens: 4096,
+            extra_body: None,
         };
 
         // Multi-turn conversation: system → user (Go code) → assistant (code response) → user (follow-up)

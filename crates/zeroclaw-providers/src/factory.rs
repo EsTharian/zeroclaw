@@ -689,6 +689,9 @@ impl FamilyProviderFactory for AnthropicModelProviderConfig {
         if let Some(mt) = opts.provider_max_tokens {
             p = p.with_max_tokens(mt);
         }
+        if let Some(extra) = opts.provider_extra.clone() {
+            p = p.with_extra_body(extra);
+        }
         Ok(Box::new(p))
     }
 }
