@@ -113,8 +113,10 @@ pub struct WsQuery {
     pub session_id: Option<String>,
     /// Optional human-readable name for the session.
     pub name: Option<String>,
-    /// Configured agent alias to run as. Required — every WebSocket
-    /// session is bound to an explicit agent (no default agent exists).
+    /// Configured agent alias to run as. When omitted, the server falls
+    /// back to `[acp].default_agent`, then auto-selects when exactly one
+    /// `[agents.<alias>]` entry is configured — mirroring the ACP
+    /// `session/new` resolver.
     #[serde(default, alias = "agentAlias", alias = "agent")]
     pub agent_alias: Option<String>,
     /// Project root / working directory for this session.
@@ -199,27 +201,44 @@ pub async fn handle_ws_chat(
         ws
     };
 
-    // Reject the upgrade up-front when the client didn't pick an agent.
-    // No default — every WS session is bound to an explicit agent.
-    let Some(agent_alias) = params.agent_alias.filter(|s| !s.trim().is_empty()) else {
-        return (
-            axum::http::StatusCode::BAD_REQUEST,
-            "Missing required `agent` query parameter — pass `?agent=<alias>` matching a configured [agents.<alias>] entry.",
-        )
-            .into_response();
-    };
-    {
+    // Resolve agent alias: explicit param → `[acp].default_agent` → auto-select
+    // when exactly one agent is configured. Mirrors the ACP `session/new`
+    // resolver in `zeroclaw_channels::orchestrator::acp_server` so the
+    // dashboard `/ws/chat` and ACP behave consistently.
+    let agent_alias = {
         let cfg = state.config.read();
-        if cfg.agent(&agent_alias).is_none() {
+        let resolved = params
+            .agent_alias
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or_else(|| cfg.acp.default_agent.clone())
+            .or_else(|| {
+                if cfg.agents.len() == 1 {
+                    cfg.agents.keys().next().cloned()
+                } else {
+                    None
+                }
+            });
+        let Some(alias) = resolved else {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                "Missing `agent` query parameter and no fallback configured — pass `?agent=<alias>` or set `[acp].default_agent`.",
+            )
+                .into_response();
+        };
+        if cfg.agent(&alias).is_none() {
             return (
                 axum::http::StatusCode::BAD_REQUEST,
                 format!(
-                    "Unknown agent `{agent_alias}` — no [agents.{agent_alias}] entry configured."
+                    "Unknown agent `{alias}` — no [agents.{alias}] entry configured."
                 ),
             )
                 .into_response();
         }
-    }
+        alias
+    };
 
     let session_id = params.session_id;
     let session_name = params.name;
