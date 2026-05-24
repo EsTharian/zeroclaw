@@ -31,6 +31,36 @@ impl CronAddTool {
         }
     }
 
+    /// Build the `delivery.channel` enum from the calling agent's configured
+    /// channels (composite `<type>.<alias>` form). When the agent has no
+    /// channels configured (or its alias isn't resolvable), fall back to the
+    /// bare channel types so the schema stays valid for tests and for
+    /// onboarding scenarios where channels haven't been wired yet.
+    fn delivery_channel_enum(&self) -> Vec<serde_json::Value> {
+        const BARE_TYPES: &[&str] = &[
+            "telegram",
+            "discord",
+            "slack",
+            "mattermost",
+            "matrix",
+            "qq",
+            "webhook",
+            "lark",
+            "feishu",
+        ];
+        let mut values: Vec<serde_json::Value> =
+            BARE_TYPES.iter().map(|t| json!(t)).collect();
+        if let Some(agent) = self.config.agent(&self.agent_alias) {
+            for ch in &agent.channels {
+                let v = json!(ch.as_str());
+                if !values.contains(&v) {
+                    values.push(v);
+                }
+            }
+        }
+        values
+    }
+
     fn plain_string_schedule_error(raw: &str) -> Option<String> {
         let schedule = raw.trim();
         if schedule.starts_with('{') {
@@ -176,8 +206,8 @@ impl Tool for CronAddTool {
                         },
                         "channel": {
                             "type": "string",
-                            "enum": ["telegram", "discord", "slack", "mattermost", "matrix", "qq", "webhook", "lark", "feishu"],
-                            "description": "Channel type to deliver output to"
+                            "enum": self.delivery_channel_enum(),
+                            "description": "Delivery channel as a full `<type>.<alias>` composite (e.g. `telegram.majordomo`). The runtime dispatcher requires this exact form. The enum lists only the channels this agent is configured to use. A bare channel type (e.g. `telegram`) is also accepted and auto-resolved to the agent's first configured channel of that type, but the composite form is preferred."
                         },
                         "to": {
                             "type": "string",
@@ -291,7 +321,40 @@ impl Tool for CronAddTool {
             .unwrap_or(false);
         let delivery = match args.get("delivery") {
             Some(v) => match serde_json::from_value::<DeliveryConfig>(v.clone()) {
-                Ok(cfg) => Some(cfg),
+                Ok(mut cfg) => {
+                    // Normalize a bare channel type ("telegram") to the calling
+                    // agent's composite ref ("telegram.majordomo"). The tool
+                    // schema only exposes the bare type, but the runtime
+                    // delivery dispatcher requires `<type>.<alias>`. Without
+                    // this, deliveries silently fail with `best_effort=true`
+                    // and `delete_after_run=1` then wipes the job.
+                    if let Some(channel) = cfg.channel.as_deref()
+                        && !channel.contains('.')
+                        && let Some(agent) = self.config.agent(&self.agent_alias)
+                    {
+                        let needle = format!("{channel}.");
+                        let resolved = agent
+                            .channels
+                            .iter()
+                            .map(|c| c.as_str())
+                            .find(|c| c.starts_with(&needle));
+                        if let Some(composite) = resolved {
+                            cfg.channel = Some(composite.to_string());
+                        } else {
+                            return Ok(ToolResult {
+                                success: false,
+                                output: String::new(),
+                                error: Some(format!(
+                                    "delivery.channel {channel:?} is ambiguous or unconfigured for \
+                                     agent {alias:?}; pass the full `<type>.<alias>` form (e.g. \
+                                     `{channel}.<your-alias>`)",
+                                    alias = self.agent_alias,
+                                )),
+                            });
+                        }
+                    }
+                    Some(cfg)
+                }
                 Err(e) => {
                     return Ok(ToolResult {
                         success: false,
