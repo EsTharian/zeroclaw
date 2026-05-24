@@ -3440,6 +3440,33 @@ pub async fn run(
                     }
                     None => (None, msg.clone()),
                 };
+
+            // ── Parse `/deep` directive: optional per-turn iteration boost ──
+            // When present, override `agent.max_tool_iterations` for this turn
+            // with `DEEP_DIRECTIVE_MAX_TOOL_ITERATIONS` so deep research /
+            // multi-step refactors can run without bumping the global cap.
+            let (effective_max_tool_iterations, effective_msg) =
+                match crate::agent::thinking::parse_deep_directive(&effective_msg) {
+                    Some(remaining) => {
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_attrs(::serde_json::json!({
+                                "from": agent.max_tool_iterations,
+                                "to": crate::agent::thinking::DEEP_DIRECTIVE_MAX_TOOL_ITERATIONS,
+                            })),
+                            "Deep directive parsed: tool-iteration budget boosted for this turn"
+                        );
+                        (
+                            crate::agent::thinking::DEEP_DIRECTIVE_MAX_TOOL_ITERATIONS,
+                            remaining,
+                        )
+                    }
+                    None => (agent.max_tool_iterations, effective_msg),
+                };
             let thinking_level = crate::agent::thinking::resolve_thinking_level(
                 thinking_directive,
                 None,
@@ -3549,7 +3576,7 @@ pub async fn run(
                             channel_name,
                             None,
                             &config.multimodal,
-                            agent.max_tool_iterations,
+                            effective_max_tool_iterations,
                             None,
                             None,
                             None,
@@ -3777,6 +3804,30 @@ pub async fn run(
                         }
                         None => (None, user_input.clone()),
                     };
+
+                // ── Parse `/deep` directive: per-turn iteration boost ──
+                let (effective_max_tool_iterations, effective_input) =
+                    match crate::agent::thinking::parse_deep_directive(&effective_input) {
+                        Some(remaining) => {
+                            ::zeroclaw_log::record!(
+                                INFO,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_attrs(::serde_json::json!({
+                                    "from": agent.max_tool_iterations,
+                                    "to": crate::agent::thinking::DEEP_DIRECTIVE_MAX_TOOL_ITERATIONS,
+                                })),
+                                "Deep directive parsed (interactive CLI)"
+                            );
+                            (
+                                crate::agent::thinking::DEEP_DIRECTIVE_MAX_TOOL_ITERATIONS,
+                                remaining,
+                            )
+                        }
+                        None => (agent.max_tool_iterations, effective_input),
+                    };
                 let thinking_level = crate::agent::thinking::resolve_thinking_level(
                     thinking_directive,
                     None,
@@ -3934,7 +3985,7 @@ pub async fn run(
                                 channel_name,
                                 None,
                                 &config.multimodal,
-                                agent.max_tool_iterations,
+                                effective_max_tool_iterations,
                                 Some(cancel_token.clone()),
                                 Some(delta_tx.clone()),
                                 None,

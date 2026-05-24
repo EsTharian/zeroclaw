@@ -28,6 +28,31 @@ pub struct ThinkingParams {
     pub system_prompt_prefix: Option<String>,
 }
 
+/// Tool-iteration budget granted to a turn that opens with `/deep`. Picked to
+/// be high enough for genuinely deep research/code-edit flows (memory walks,
+/// multi-step web searches, large refactors) without going actually unbounded
+/// — true unbounded loops are how runaway-cost bugs slip in.
+pub const DEEP_DIRECTIVE_MAX_TOOL_ITERATIONS: usize = 200;
+
+/// Parse a leading `/deep` directive from a user message.
+///
+/// Returns `Some(remaining_message)` (with the directive stripped + leading
+/// whitespace trimmed) when present, `None` otherwise. The caller can then
+/// substitute [`DEEP_DIRECTIVE_MAX_TOOL_ITERATIONS`] for the agent's normal
+/// `max_tool_iterations` budget for the rest of the turn.
+///
+/// The token is matched as a whole word — `/deepfake` is not a directive.
+pub fn parse_deep_directive(message: &str) -> Option<String> {
+    let trimmed = message.trim_start();
+    let rest = trimmed.strip_prefix("/deep")?;
+    // Accept end-of-string OR whitespace as the boundary; reject `/deepfake`.
+    let is_boundary = rest.chars().next().map_or(true, char::is_whitespace);
+    if !is_boundary {
+        return None;
+    }
+    Some(rest.trim_start().to_string())
+}
+
 /// Parse a `/think:<level>` directive from the start of a message.
 ///
 /// Returns `Some((level, remaining_message))` if a directive is found,
